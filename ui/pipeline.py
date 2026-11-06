@@ -80,6 +80,7 @@ class RunConfig:
     uploaded_vcfs: List[str] = field(default_factory=list)
     ne: int = 10000
     mutation_rate: str = '1e-8'
+    new_mutations: bool = False  # new mutations while DNA is passed down the family (breaks Mendel)
     relationships: bool = True
     ped: bool = True
     picture: bool = True
@@ -515,7 +516,7 @@ def _simulate_genomes(G: nx.DiGraph, fam_dir: Path, work: Path, pools: List[Tupl
     for k, (name, pool) in enumerate(pools):
         out = work / f'genome{k}'
         _run_ped_sim(['-t', 'sim_genomes_exact', '-n', ped_nx, '-v', pool, '-e', exact,
-                      '-mu', cfg.mutation_rate,
+                      '-mu', cfg.mutation_rate if cfg.new_mutations else '0',
                       '-r', cfg.regions[k].recomb_rate if cfg.founder_source == 'simulate' else '1e-8',
                       '-s', fam_seed + 1000 * k, '-o', out],
                      f'Genome simulation (region {name})', log, expect=Path(f'{out}_genomes.vcf'))

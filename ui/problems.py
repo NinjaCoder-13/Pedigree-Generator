@@ -110,7 +110,21 @@ def in_scope(chrom: pd.Series, pos: pd.Series, scope: Optional[dict]) -> np.ndar
     return mask
 
 
-def _mask_vcf(src: Path, dst: Path, masked: Sequence[str], scope: Optional[dict]) -> None:
+def new_mutation_sites(fam_dir: Path) -> np.ndarray:
+    """True for variants that arose as new mutations inside the pedigree (SLiM tick of origin > 1),
+    in VCF order. Founder variants are loaded at tick 1. These are the variants that break Mendel's rules."""
+    out = subprocess.run(['bcftools', 'query', '-f', '%INFO/TO\n', str(fam_dir / 'genotypes.vcf.gz')],
+                         env=P._env(), capture_output=True, text=True)
+    return np.array([x.strip() not in ('', '.', '1') for x in out.stdout.splitlines()], dtype=bool)
+
+
+def _site_is_new_mutation(info: str) -> bool:
+    to = next((x[3:] for x in info.split(';') if x.startswith('TO=')), '1')
+    return to not in ('', '.', '1')
+
+
+def _mask_vcf(src: Path, dst: Path, masked: Sequence[str], scope: Optional[dict],
+              drop_new_mutations: bool = False) -> None:
     env = P._env()
     reader = subprocess.Popen(['bcftools', 'view', str(src)], env=env, stdout=subprocess.PIPE, text=True)
     writer = subprocess.Popen(['bcftools', 'view', '-Oz', '-o', str(dst), '-'], env=env,
@@ -126,6 +140,8 @@ def _mask_vcf(src: Path, dst: Path, masked: Sequence[str], scope: Optional[dict]
             if line.startswith('#'):
                 cols = [i for i, s in enumerate(fields) if i >= 9 and s in masked]
                 writer.stdin.write(line)
+                continue
+            if drop_new_mutations and _site_is_new_mutation(fields[7]):
                 continue
             if site_in_scope(fields[0], fields[1], scope):
                 for i in cols:
@@ -168,8 +184,11 @@ solution/  (made by "Solve" in the app; delete this folder to hand out the probl
 
 
 def make_problem(source: Path, masks: Dict[str, List[str]], name: str, scope: Optional[dict] = None,
-                 progress: Optional[ProgressFn] = None) -> Path:
-    """Copy `source` into a new dataset with the genotypes of `masks[family]` removed."""
+                 drop_new_mutations: bool = True, progress: Optional[ProgressFn] = None) -> Path:
+    """Copy `source` into a new dataset with the genotypes of `masks[family]` removed.
+
+    drop_new_mutations: leave out variants that arose inside the pedigree, so every variant left
+    follows Mendel's rules and the true genotype is always among the solver's answers."""
     progress = progress or (lambda f, m: None)
     masks = {f: sorted(map(str, ids), key=int) for f, ids in masks.items() if ids}
     if not masks:
@@ -181,28 +200,43 @@ def make_problem(source: Path, masks: Dict[str, List[str]], name: str, scope: Op
             if f.is_file() and f.name not in ('log.txt',):
                 shutil.copy(f, out / f.name)
         fam_dirs = sorted(d for d in source.iterdir() if d.is_dir() and d.name.startswith('family_'))
+        variants, dropped = {}, {}
         for k, fam in enumerate(fam_dirs):
             progress(k / len(fam_dirs), f'Copying {fam.name}')
             dst = out / fam.name
             dst.mkdir()
             ids = masks.get(fam.name, [])
+            unknown = set(ids) - set(read_pedigree(fam).nodes)
+            if unknown:
+                raise P.PipelineError(f'{fam.name} has no person with ID {", ".join(sorted(unknown, key=int))}.')
+            new = new_mutation_sites(fam) if drop_new_mutations and (fam / 'genotypes.vcf.gz').exists() else None
+            rewrite = bool(ids) or (new is not None and new.any())
             for f in fam.iterdir():
-                if f.is_file() and not (ids and f.name.startswith('genotypes')):
+                if f.is_file() and not (rewrite and f.name.startswith('genotypes')):
                     shutil.copy(f, dst / f.name)
-            if not ids:
+            if not rewrite:
                 continue
             gt = letter_table(fam)
+            if new is not None:
+                if len(new) != len(gt):
+                    raise P.PipelineError(f'{fam.name}: the VCF and the letters file have different variants.')
+                gt = gt[~new].reset_index(drop=True)
+                dropped[fam.name] = int(new.sum())
+                variants[fam.name] = len(gt)
             rows = in_scope(gt['CHROM'], gt['POS'], scope)
             for i in ids:
                 gt.loc[rows, i] = 'NA'
             gt.to_csv(dst / 'genotypes_letters.tsv.gz', sep='\t', index=False)
-            _mask_vcf(fam / 'genotypes.vcf.gz', dst / 'genotypes.vcf.gz', ids, scope)
+            _mask_vcf(fam / 'genotypes.vcf.gz', dst / 'genotypes.vcf.gz', ids, scope, new is not None)
 
         summary = pd.read_csv(out / 'summary.csv')
+        if variants:
+            summary['variants'] = [variants.get(f, v) for f, v in zip(summary['family'], summary['variants'])]
         summary['removed_people'] = [len(masks.get(f, [])) for f in summary['family']]
         summary.to_csv(out / 'summary.csv', index=False)
 
         problem = dict(source=source.name, source_path=str(source), scope=scope, masked=masks,
+                       new_mutations_dropped=dropped if drop_new_mutations else None,
                        created=dt.datetime.now().isoformat(timespec='seconds'))
         (out / PROBLEM_FILE).write_text(json.dumps(problem, indent=2))
         settings = json.loads((out / 'settings.json').read_text())
@@ -397,6 +431,10 @@ def solve_problem(run_dir: Path, list_combinations: bool = False, max_combinatio
         truth = None
         if has_truth:
             t = letter_table(source / fam)
+            if problem.get('new_mutations_dropped') is not None:
+                new = new_mutation_sites(source / fam)
+                if len(new) == len(t):
+                    t = t[~new].reset_index(drop=True)
             if len(t) == len(gt) and (t['POS'].to_numpy() == gt['POS'].to_numpy()).all():
                 truth = np.column_stack([t[p].map(dosage).to_numpy() for p in masked])
 

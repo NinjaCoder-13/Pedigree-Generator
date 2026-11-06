@@ -294,6 +294,19 @@ def problem_maker():
         end = c[2].number_input('To position (bp, 0 = end)', 0, 10**10, 0, key='pm_end')
         scope = dict(chromosomes=chosen, start=int(start) or None, end=int(end) or None)
 
+    drop_new = st.checkbox(
+        'Leave out variants from new mutations inside the family (recommended)', value=True, key='pm_dropnew',
+        help='Variants that first appeared as a new mutation while DNA was passed down the family break '
+             'Mendel\'s rules, so they can give CONFLICT or an answer set that misses the truth. Datasets made '
+             'with "Allow new mutations inside the family" off have none.')
+    if drop_new:
+        n_new = {f: int(Q.new_mutation_sites(src / f).sum()) for f in families}
+        if sum(n_new.values()):
+            st.caption(f'{sum(n_new.values())} such variant(s) will be left out: '
+                       + ', '.join(f'{f}: {n}' for f, n in n_new.items() if n) + '.')
+        else:
+            st.caption('This dataset has no variants from new mutations.')
+
     st.write('')
     step(4, 'Save the problem')
     if masks:
@@ -313,7 +326,7 @@ def problem_maker():
     if st.button('💾 Save problem dataset', type='primary', disabled=bool(problems), use_container_width=True):
         try:
             with st.spinner('Removing genotypes…'):
-                out = Q.make_problem(src, masks, name, scope)
+                out = Q.make_problem(src, masks, name, scope, drop_new)
             st.session_state['last_problem'] = str(out)
             st.success(f'Saved as **outputs/{out.name}**. Switch to **Solve a problem** to work out the answers.')
         except Exception as e:
@@ -339,7 +352,8 @@ def show_solution(run_dir: Path, problem: dict):
         else:
             st.warning('Answer check: at some variants the true genotype is not among the possible ones. This '
                        'happens when a new mutation in the simulation broke Mendel\'s rules there (see the '
-                       'answer check table below).')
+                       'answer check table below). Make the problem again with "Leave out variants from new '
+                       'mutations" ticked to avoid it.')
     else:
         st.info('The original dataset was not found, so the answers could not be checked against the truth.')
     st.caption(f"Solved {meta['solved']} · {meta['method']}")
@@ -427,6 +441,12 @@ def problem_solver():
         + (f", to {scope['end']:,} bp" if scope.get('end') else ''))
     st.markdown(f"Made from **{problem['source']}**. Genotypes removed at {where} for: "
                 + '; '.join(f"**{f}**: {', '.join(v)}" for f, v in problem['masked'].items()))
+    dropped = problem.get('new_mutations_dropped')
+    if dropped is not None:
+        st.caption(f'{sum(dropped.values())} variant(s) from new mutations inside the families were left out, '
+                   'so every variant follows Mendel\'s rules.')
+    else:
+        st.caption('Variants from new mutations inside the families were kept; some may give CONFLICT.')
 
     c = st.columns([2, 1, 1])
     want_comb = c[0].checkbox('Also list every combination', key=f'ps_comb_{run_name}',
@@ -521,6 +541,7 @@ with tab_new:
     step(3, 'Genetic data', 'Simulate DNA (genotypes) for every person, inherited down the family tree.')
     genotypes = st.toggle('Simulate genotypes (DNA)', value=True)
     uploads, regions_df = [], None
+    new_mutations = False
     mutation_rate, ne = '1e-8', 10000
     source = 'simulate'
     if genotypes:
@@ -543,13 +564,21 @@ with tab_new:
                 })
             with st.expander('Advanced DNA settings'):
                 a, b = st.columns(2)
-                mutation_rate = a.selectbox('Mutation rate (per base per generation)', P.RATES, index=1)
+                mutation_rate = a.selectbox('Mutation rate (per base per generation)', P.RATES, index=1,
+                                            help='Makes the founders\' genetic diversity, and the rate of new '
+                                                 'mutations in the family if those are allowed below.')
                 ne = b.number_input('Population size the founders come from', 1000, 1_000_000, 10000, step=1000,
                                     help='Bigger = more genetic diversity among founders.')
         else:
             st.markdown('Upload one VCF per chromosome. Each needs at least as many samples as founders in a '
                         'family; ideally enough for every founder in the whole dataset.')
             uploads = st.file_uploader('VCF files', type=['vcf', 'gz'], accept_multiple_files=True)
+        new_mutations = st.checkbox(
+            'Allow new mutations inside the family', value=False,
+            help='Off: children inherit only their parents\' DNA, so every variant follows Mendel\'s rules '
+                 '(best for pedigree problems). On: a few brand-new mutations appear as DNA is passed down, '
+                 'like in real life, and those variants break Mendel\'s rules.')
+        if source == 'upload' and new_mutations:
             with st.expander('Advanced DNA settings'):
                 mutation_rate = st.selectbox('Mutation rate (per base per generation)', P.RATES, index=1)
 
@@ -602,7 +631,7 @@ with tab_new:
             min_size=int(min_size), max_size=int(max_size), max_attempts=int(max_attempts),
             broaden=broaden, half_sibs=half_sibs, half_sib_prob=hs_prob,
             genotypes=genotypes, founder_source=source, regions=regions or [P.Region()],
-            uploaded_vcfs=upload_paths, ne=int(ne), mutation_rate=mutation_rate,
+            uploaded_vcfs=upload_paths, ne=int(ne), mutation_rate=mutation_rate, new_mutations=new_mutations,
             relationships=want_rel, ped=want_ped, picture=want_pic)
 
         with st.status('Generating your dataset...', expanded=True) as status:
