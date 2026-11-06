@@ -6,6 +6,7 @@ Start it with:  ./run_ui.sh   (or: streamlit run ui/app.py inside the ped_sim en
 
 import datetime as dt
 import io
+import json
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pipeline as P  # noqa: E402
+import problems as Q  # noqa: E402
 
 st.set_page_config(page_title='Pedigree Dataset Generator', page_icon='🧬', layout='wide')
 
@@ -60,16 +62,18 @@ def _pedigree_with_genotypes(fam_dir: str, variant: int) -> bytes:
     prof = pd.read_csv(fam_dir / 'profiles.txt', sep='\t', dtype={'ID': str})
     row = _letter_table(str(fam_dir)).iloc[variant]
     buf = io.BytesIO()
+    gts = {k: v if isinstance(v, str) and v != 'NA' else '?' for k, v in row.iloc[3:].items()}
     P.draw_pedigree(G, prof, buf, f'{fam_dir.name}  ·  gene {row["GENE"]} '
-                    f'(chr {row["CHROM"]}, position {row["POS"]})', genotypes=row.iloc[3:].to_dict())
+                    f'(chr {row["CHROM"]}, position {row["POS"]})', genotypes=gts,
+                    highlight={k for k, v in gts.items() if v == '?'})
     return buf.getvalue()
 
 
-def _zip_bytes(folder: Path) -> bytes:
+def _zip_bytes(folder: Path, skip: tuple = ()) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
         for f in folder.rglob('*'):
-            if f.is_file():
+            if f.is_file() and not any(part in skip for part in f.relative_to(folder).parts):
                 z.write(f, Path(folder.name) / f.relative_to(folder))
     return buf.getvalue()
 
@@ -176,6 +180,280 @@ def show_run(run_dir: Path, key: str):
 
 
 # ----------------------------------------------------------------------------
+# pedigree problems: remove genotypes, then list every genotype that fits
+# ----------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def _family(fam_dir: str):
+    fam_dir = Path(fam_dir)
+    G = Q.read_pedigree(fam_dir)
+    prof = pd.read_csv(fam_dir / 'profiles.txt', sep='\t', dtype=str)
+    return G, prof
+
+
+@st.cache_data(show_spinner='Drawing the family tree…')
+def _masked_tree(fam_dir: str, masked: tuple) -> bytes:
+    G, prof = _family(fam_dir)
+    buf = io.BytesIO()
+    P.draw_pedigree(G, prof, buf, f'{Path(fam_dir).name}  ·  {len(masked)} people with genotypes removed',
+                    highlight=set(masked))
+    return buf.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def _read_tsv(path: str, mtime: float) -> pd.DataFrame:
+    return pd.read_csv(path, sep='\t', dtype=str, keep_default_na=False)
+
+
+@st.cache_data(show_spinner='Drawing the family tree…')
+def _solution_tree(fam_dir: str, sol_path: str, variant: int, masked: tuple, mtime: float) -> bytes:
+    G, prof = _family(fam_dir)
+    known = _letter_table(fam_dir).iloc[variant]
+    sol = _read_tsv(sol_path, mtime).iloc[variant]
+    gts = {k: v for k, v in known.iloc[3:].items() if isinstance(v, str) and v != 'NA'}
+    for p in masked:
+        if sol[p] != '-':
+            gts[p] = sol[p]
+    buf = io.BytesIO()
+    P.draw_pedigree(G, prof, buf, f'{Path(fam_dir).name}  ·  gene {sol["GENE"]} (chr {sol["CHROM"]}, '
+                    f'position {sol["POS"]})  ·  {sol["COMBINATIONS"]} valid combination(s)',
+                    genotypes=gts, highlight={p for p in masked if sol[p] != '-'})
+    return buf.getvalue()
+
+
+def problem_maker():
+    sources = Q.source_datasets()
+    if not sources:
+        st.info('First make a dataset **with genotypes** in the **New dataset** tab.')
+        return
+
+    step(1, 'Pick the original dataset', 'Only datasets with genotypes are listed. The original is never changed.')
+    by_name = {r.name: r for r in sources}
+    src_name = st.selectbox('Original dataset', list(by_name), key='pm_src', help='Newest first.')
+    src = by_name[src_name]
+    summary = pd.read_csv(src / 'summary.csv')
+    families = summary['family'].tolist()
+
+    st.write('')
+    step(2, 'Choose whose genotypes to remove',
+         'Pick a family, then the people. Your choices are remembered for each family, so you can '
+         'remove people in several families before saving.')
+    fam = st.selectbox('Family', families, key=f'pm_fam_{src_name}')
+    fam_dir = src / fam
+    G, prof = _family(str(fam_dir))
+    sex = dict(zip(prof['ID'], prof['Sex']))
+    layer = P.generation_layers(G, prof)
+    ids = sorted(G.nodes, key=int)
+    founders = {n for n in ids if G.in_degree(n) == 0}
+    # Widget state is dropped when a widget is not shown, so choices live in their own store.
+    store = st.session_state.setdefault('pm_masks', {}).setdefault(src_name, {})
+    sel_key = f'pm_sel_{src_name}_{fam}'
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = store.get(fam, [])
+
+    def set_selection(v):
+        store[fam] = sorted(set(v), key=int)
+        st.session_state[sel_key] = store[fam]
+
+    def add_generation(g):
+        set_selection(set(st.session_state.get(sel_key, [])) | {n for n in ids if layer[n] == g})
+
+    left, right = st.columns([3, 2], gap='large')
+    with right:
+        selected = st.multiselect(
+            'People whose genotypes will be removed', ids, key=sel_key,
+            on_change=lambda: store.update({fam: list(st.session_state[sel_key])}),
+            format_func=lambda n: f'{n} · {sex.get(n, "?")} · gen {layer[n] + 1}' + (' · founder' if n in founders else ''))
+        g1, g2 = st.columns([2, 1])
+        gen = g1.selectbox('Quick pick: a whole generation', range(max(layer.values()) + 1),
+                           format_func=lambda g: f'Generation {g + 1} ({sum(layer[n] == g for n in ids)} people)',
+                           key=f'pm_gen_{src_name}_{fam}')
+        g2.write('')
+        g2.button('Add them', on_click=add_generation, args=(gen,), key=f'pm_addgen_{src_name}_{fam}',
+                  use_container_width=True)
+        st.button('Clear this family', on_click=set_selection, args=([],),
+                  key=f'pm_clear_{src_name}_{fam}')
+        st.markdown(f'<div class="muted">{len(selected)} of {len(ids)} people chosen in {fam}.</div>',
+                    unsafe_allow_html=True)
+    with left:
+        st.image(_masked_tree(str(fam_dir), tuple(selected)),
+                 caption='Grey = genotypes will be removed. Squares = male, circles = female.')
+
+    masks = {f: sorted(store.get(f, []), key=int) for f in families if store.get(f)}
+
+    st.write('')
+    step(3, 'Which variants?', 'Usually the whole genome. You can also remove only part of it.')
+    scope_choice = st.radio('Remove their genotypes at', ['Every variant (whole genome)', 'Only some variants'],
+                            horizontal=True, key='pm_scope', label_visibility='collapsed')
+    scope = None
+    if scope_choice == 'Only some variants':
+        chroms = sorted(_letter_table(str(src / families[0]))['CHROM'].astype(str).unique().tolist())
+        c = st.columns([2, 1, 1])
+        chosen = c[0].multiselect('Chromosomes', chroms, default=chroms, key='pm_chroms')
+        start = c[1].number_input('From position (bp, 0 = start)', 0, 10**10, 0, key='pm_start')
+        end = c[2].number_input('To position (bp, 0 = end)', 0, 10**10, 0, key='pm_end')
+        scope = dict(chromosomes=chosen, start=int(start) or None, end=int(end) or None)
+
+    st.write('')
+    step(4, 'Save the problem')
+    if masks:
+        st.dataframe(pd.DataFrame([dict(family=f, removed=len(v), people=', '.join(v)) for f, v in masks.items()]),
+                     hide_index=True, use_container_width=True)
+    name = st.text_input('Name of the new dataset', value=f'{src_name}__problem', key=f'pm_name_{src_name}',
+                         help='Saved as a new folder in outputs/. If the name is taken, _2, _3, … is added.')
+    problems = []
+    if not masks:
+        problems.append('Choose at least one person.')
+    if scope is not None and not scope['chromosomes']:
+        problems.append('Choose at least one chromosome.')
+    if scope is not None and scope['start'] and scope['end'] and scope['start'] > scope['end']:
+        problems.append('"From position" is after "To position".')
+    for p in problems:
+        st.warning(p)
+    if st.button('💾 Save problem dataset', type='primary', disabled=bool(problems), use_container_width=True):
+        try:
+            with st.spinner('Removing genotypes…'):
+                out = Q.make_problem(src, masks, name, scope)
+            st.session_state['last_problem'] = str(out)
+            st.success(f'Saved as **outputs/{out.name}**. Switch to **Solve a problem** to work out the answers.')
+        except Exception as e:
+            st.error(str(e))
+
+
+def show_solution(run_dir: Path, problem: dict):
+    sol_dir = run_dir / Q.SOLUTION_DIR
+    summ = pd.read_csv(sol_dir / 'solution_summary.csv', dtype={'ID': str})
+    meta = json.loads((sol_dir / 'solution.json').read_text())
+    tot = summ['masked_variants'].sum()
+    c = st.columns(4)
+    c[0].metric('People to solve', len(summ))
+    c[1].metric('Exactly one answer', f"{100 * summ['one_possible'].sum() / max(tot, 1):.1f}%",
+                help='Share of (person, variant) cells where only one genotype fits.')
+    c[2].metric('Two possible', f"{100 * summ['two_possible'].sum() / max(tot, 1):.1f}%")
+    c[3].metric('Any genotype possible', f"{100 * summ['three_possible'].sum() / max(tot, 1):.1f}%")
+    if 'true_in_possible_pct' in summ:
+        worst = summ['true_in_possible_pct'].min()
+        if worst == 100:
+            st.success('Answer check: the true genotype (from the original dataset) is among the possible ones '
+                       'for every person at every variant.')
+        else:
+            st.warning('Answer check: at some variants the true genotype is not among the possible ones. This '
+                       'happens when a new mutation in the simulation broke Mendel\'s rules there (see the '
+                       'answer check table below).')
+    else:
+        st.info('The original dataset was not found, so the answers could not be checked against the truth.')
+    st.caption(f"Solved {meta['solved']} · {meta['method']}")
+    st.dataframe(summ, hide_index=True, use_container_width=True)
+
+    fams = list(problem['masked'])
+    fam = st.selectbox('Look at a family', fams, key=f'ps_fam_{run_dir.name}')
+    masked = tuple(problem['masked'][fam])
+    sol_path = sol_dir / f'{fam}_possible_genotypes.tsv.gz'
+    mtime = sol_path.stat().st_mtime
+    sol = _read_tsv(str(sol_path), mtime)
+
+    only_amb = st.checkbox('Only list variants where someone has more than one possible genotype', value=True,
+                           key=f'ps_amb_{run_dir.name}')
+    rows = range(len(sol))
+    if only_amb:
+        amb = sol[list(masked)].apply(lambda col: col.str.contains('/')).any(axis=1)
+        rows = [i for i in rows if amb.iat[i]]
+    if not rows:
+        st.info('Every removed genotype in this family has exactly one possible answer.')
+        return
+    v = st.selectbox('Variant', rows, key=f'ps_var_{run_dir.name}_{fam}_{only_amb}',
+                     format_func=lambda i: f'{sol["GENE"].iat[i]}  ·  chr {sol["CHROM"].iat[i]}, position '
+                                           f'{sol["POS"].iat[i]}  ·  {sol["COMBINATIONS"].iat[i]} combination(s)')
+    st.image(_solution_tree(str(run_dir / fam), str(sol_path), v, masked, mtime),
+             caption='Grey = genotype was removed; the label lists every genotype that person could have '
+                     '(e.g. Aa/aa = Aa or aa). Others show their known genotype.')
+
+    tabs = st.tabs(['🧩 Possible genotypes', '🔢 Combinations', '✅ Answer check'])
+    with tabs[0]:
+        st.caption('One row per variant. COMBINATIONS = number of ways to fill in all removed genotypes in the '
+                   'family at once. "-" = known at this variant. CONFLICT = the known relatives break Mendel\'s rules.')
+        st.dataframe(sol.iloc[list(rows)] if only_amb else sol, hide_index=True, use_container_width=True, height=320)
+    with tabs[1]:
+        comb_path = sol_dir / f'{fam}_combinations.tsv.gz'
+        if comb_path.exists():
+            comb = _read_tsv(str(comb_path), comb_path.stat().st_mtime)
+            here = comb[(comb['CHROM'] == sol['CHROM'].iat[v]) & (comb['POS'] == sol['POS'].iat[v])]
+            st.caption(f'Every valid way to fill in the removed genotypes at the selected variant '
+                       f'(listing stops at {meta["max_combinations_per_variant"]:,} per variant).')
+            st.dataframe(here, hide_index=True, use_container_width=True, height=320)
+        else:
+            st.info('Combinations were not listed. Tick **Also list every combination** and solve again.')
+    with tabs[2]:
+        chk_path = sol_dir / f'{fam}_answer_check.tsv.gz'
+        if chk_path.exists():
+            chk = _read_tsv(str(chk_path), chk_path.stat().st_mtime)
+            miss = chk[chk['TRUE_IN_POSSIBLE'] != 'True']
+            st.caption('TRUE = genotype in the original dataset · POSSIBLE = what the solver allows.')
+            if len(miss):
+                st.markdown(f'**{len(miss)} cells** where the true genotype is not among the possible ones:')
+                st.dataframe(miss, hide_index=True, use_container_width=True, height=240)
+            st.dataframe(chk, hide_index=True, use_container_width=True, height=320)
+        else:
+            st.info('No answer check (the original dataset was not found).')
+
+    st.divider()
+    d = st.columns(4)
+    if d[0].button('📦 Prepare ZIPs', key=f'ps_zip_{run_dir.name}'):
+        st.session_state[f'ps_zip_{run_dir.name}'] = (_zip_bytes(run_dir, skip=(Q.SOLUTION_DIR,)), _zip_bytes(run_dir))
+    if st.session_state.get(f'ps_zip_{run_dir.name}'):
+        only, full = st.session_state[f'ps_zip_{run_dir.name}']
+        d[1].download_button('⬇️ Problem only', only, file_name=f'{run_dir.name}.zip', mime='application/zip',
+                             help='Without the solution folder, ready to hand out.', key=f'ps_dl1_{run_dir.name}')
+        d[2].download_button('⬇️ Problem + solution', full, file_name=f'{run_dir.name}_with_solution.zip',
+                             mime='application/zip', key=f'ps_dl2_{run_dir.name}')
+
+
+def problem_solver():
+    probs = Q.problem_datasets()
+    if not probs:
+        st.info('No problem datasets yet. Make one with **Make a problem**.')
+        return
+    by_name = {r.name: r for r in probs}
+    names = list(by_name)
+    last = Path(st.session_state.get('last_problem', '')).name
+    run_name = st.selectbox('Problem dataset', names, index=names.index(last) if last in names else 0,
+                            key='ps_run', help='Newest first.')
+    run_dir = by_name[run_name]
+    problem = Q.read_problem(run_dir)
+    scope = problem.get('scope')
+    where = 'every variant' if not scope else (
+        f"chromosome(s) {', '.join(map(str, scope['chromosomes']))}"
+        + (f", from {scope['start']:,} bp" if scope.get('start') else '')
+        + (f", to {scope['end']:,} bp" if scope.get('end') else ''))
+    st.markdown(f"Made from **{problem['source']}**. Genotypes removed at {where} for: "
+                + '; '.join(f"**{f}**: {', '.join(v)}" for f, v in problem['masked'].items()))
+
+    c = st.columns([2, 1, 1])
+    want_comb = c[0].checkbox('Also list every combination', key=f'ps_comb_{run_name}',
+                              help='Every valid way to fill in all removed genotypes of a family together, per '
+                                   'variant. Can be very many, so the list is cut off at the limit.')
+    max_comb = c[1].number_input('Limit per variant', 1, 1_000_000, 1000, disabled=not want_comb,
+                                 key=f'ps_max_{run_name}')
+    solved = (run_dir / Q.SOLUTION_DIR / 'solution_summary.csv').exists()
+    c[2].write('')
+    if c[2].button('🧠 Solve again' if solved else '🧠 Solve', type='primary', use_container_width=True,
+                   key=f'ps_solve_{run_name}'):
+        with st.status('Working out every possible genotype…', expanded=True) as status:
+            bar = st.progress(0.0, text='Starting')
+            try:
+                Q.solve_problem(run_dir, want_comb, int(max_comb),
+                                progress=lambda f, m: bar.progress(min(f, 1.0), text=m))
+                status.update(label='Solved', state='complete', expanded=False)
+                solved = True
+            except Exception as e:
+                status.update(label='Something went wrong', state='error', expanded=True)
+                st.error(str(e))
+    if solved:
+        st.divider()
+        show_solution(run_dir, problem)
+
+
+# ----------------------------------------------------------------------------
 # page
 # ----------------------------------------------------------------------------
 
@@ -185,7 +463,8 @@ st.markdown('<div class="muted">Make simulated family trees, optionally with DNA
             f'Everything is saved in the <code>outputs/</code> folder.</div>', unsafe_allow_html=True)
 st.write('')
 
-tab_new, tab_runs, tab_help = st.tabs(['➕ New dataset', '📁 My datasets', '❓ Help'])
+tab_new, tab_runs, tab_prob, tab_help = st.tabs(['➕ New dataset', '📁 My datasets', '🧩 Pedigree problems',
+                                                 '❓ Help'])
 
 with tab_new:
     years_all = P.available_years()
@@ -369,6 +648,21 @@ with tab_runs:
                 st.rerun()
 
 
+with tab_prob:
+    st.markdown('<div class="muted">Turn a dataset into a puzzle: remove the genotypes of people you choose, '
+                'then let the app list <b>every genotype each of them could have had</b>, judged only from '
+                'their relatives\' known genotypes and Mendel\'s rules (one variant at a time).</div>',
+                unsafe_allow_html=True)
+    st.write('')
+    mode = st.radio('Mode', ['✂️ Make a problem', '🧠 Solve a problem'], horizontal=True,
+                    label_visibility='collapsed', key='prob_mode')
+    st.write('')
+    if mode.startswith('✂️'):
+        problem_maker()
+    else:
+        problem_solver()
+
+
 with tab_help:
     st.markdown("""
 ### How it works
@@ -391,6 +685,15 @@ with tab_help:
 | **.ped file** | A text table: family, person, father, mother, sex (1 = male, 2 = female), phenotype (-9 = unknown). |
 | **MC / GD / RT** | Meiosis count (parent→child steps between two people), generation gap, and direct / full / half. |
 | **Seed** | A number that makes the randomness repeatable. |
+
+### Pedigree problems
+In the **🧩 Pedigree problems** tab you remove the genotypes of chosen people from a dataset and save that
+as a new dataset (named after the original, e.g. `mydata__problem`). **Solve** then lists, for each removed
+person and each variant, every genotype that is possible given everyone else's known genotypes, for
+example `Aa/aa`. People with no informative relatives can be anything (`AA/Aa/aa`). Answers are worked
+out for the whole family at once, so removed relatives constrain each other correctly. Optionally it
+also lists every valid *combination* for all removed people together. The answers are saved in a
+`solution/` folder inside the problem dataset; download "Problem only" to hand out the puzzle without them.
 
 ### Where are my files?
 In the `outputs/` folder inside the project, one folder per dataset. Each dataset has a `README.txt`

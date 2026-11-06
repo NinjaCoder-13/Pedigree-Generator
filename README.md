@@ -101,6 +101,13 @@ chromosomes, relationship tables, `.ped` files and family pictures) without usin
 Each dataset is saved in its own folder under `outputs/`, with a `README.txt` describing every file and a
 `settings.json` holding the settings used (re-use the seed to reproduce it). The app lives in `ui/`.
 
+The **🧩 Pedigree problems** tab turns a dataset into a puzzle. Pick people whose genotypes should be
+removed (whole genome or part of it) and save that as a new dataset named after the original
+(`<original>__problem`). **Solve** then lists, for every removed person and variant, every genotype
+consistent with Mendelian inheritance given the known relatives (e.g. `Aa/aa`), optionally every valid
+joint combination, and checks the answers against the original. Results go in the problem's `solution/`
+folder. Inference is exact and done one variant at a time (`ui/problems.py`).
+
 ---
 
 ## Command structure

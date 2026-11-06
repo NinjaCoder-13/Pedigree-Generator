@@ -270,10 +270,11 @@ def generation_layers(G: nx.DiGraph, prof: Optional[pd.DataFrame] = None) -> Dic
 
 
 def draw_pedigree(G: nx.DiGraph, prof: pd.DataFrame, path, title: str = '',
-                  genotypes: Optional[Dict[str, str]] = None) -> None:
+                  genotypes: Optional[Dict[str, str]] = None, highlight: Optional[set] = None) -> None:
     """Classic pedigree chart: partners side by side, a bar from each couple down to their children.
 
     `genotypes` (person ID -> letter genotype such as 'Aa') is written under each person.
+    `highlight` (person IDs) are drawn grey, e.g. people whose genotypes were removed.
     `path` can be a file path or a binary buffer.
     """
     sex = dict(zip(prof['ID'].astype(str), prof['Sex']))
@@ -356,12 +357,17 @@ def draw_pedigree(G: nx.DiGraph, prof: pd.DataFrame, path, title: str = '',
                 for k in kids:
                     ax.plot([pos[p][0], pos[k][0]], [pos[p][1], pos[k][1]], **line)
 
+    highlight = {str(n) for n in highlight or ()}
     for s, marker, color in [('male', 's', '#4c78a8'), ('female', 'o', '#e45756')]:
-        pts = [pos[n] for n in G.nodes if sex.get(n) == s]
-        if pts:
-            xs, ys = zip(*pts)
-            ax.scatter(xs, ys, marker=marker, s=30 if big else 300, c=color, edgecolors='white',
-                       linewidths=1, zorder=2, label=s.capitalize())
+        for grey in (False, True):
+            pts = [pos[n] for n in G.nodes if sex.get(n) == s and (str(n) in highlight) == grey]
+            if pts:
+                xs, ys = zip(*pts)
+                ax.scatter(xs, ys, marker=marker, s=30 if big else 300, c='#9ca3af' if grey else color,
+                           edgecolors='#111827' if grey else 'white', linewidths=1.5 if grey else 1, zorder=2,
+                           label=None if grey else s.capitalize())
+    if highlight:
+        ax.scatter([], [], marker='s', s=60, c='#9ca3af', edgecolors='#111827', label='Genotypes removed')
     if not big:
         for n, (x, y) in pos.items():
             ax.text(x, y, n, ha='center', va='center', fontsize=7, color='white', zorder=3, fontweight='bold')
@@ -380,7 +386,7 @@ def draw_pedigree(G: nx.DiGraph, prof: pd.DataFrame, path, title: str = '',
     ax.set_ylim(-n_layers + 0.5, 0.5)
     for side in ['top', 'right', 'bottom', 'left']:
         ax.spines[side].set_visible(False)
-    ax.legend(loc='lower right', bbox_to_anchor=(1, 1.0), ncol=2, frameon=False, fontsize=8)
+    ax.legend(loc='lower right', bbox_to_anchor=(1, 1.0), ncol=3, frameon=False, fontsize=8)
     ax.set_title(title, fontsize=11, loc='left')
     fig.tight_layout()
     fig.savefig(path, dpi=130)
