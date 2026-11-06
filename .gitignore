@@ -1,0 +1,7 @@
+outputs/*
+!outputs/.gitkeep
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/

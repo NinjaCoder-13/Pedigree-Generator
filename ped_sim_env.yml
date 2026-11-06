@@ -10,10 +10,13 @@ dependencies:
   - networkx
   - pandas
   - matplotlib
-  - msprime
   - gsl
   - bcftools
   - libdeflate=1.0
   - seaborn
   - tabix
+  - pip
+  - pip:
+    - msprime>=1.0,<1.4
+    - streamlit<1.41
 prefix: ped_sim

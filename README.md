@@ -89,6 +89,20 @@ python run_ped_sim.py -h
 
 ---
 
+## Graphical interface (easiest way to make datasets)
+
+A point-and-click web app builds whole datasets (many families, optional genotypes on one or more
+chromosomes, relationship tables, `.ped` files and family pictures) without using the command line.
+
+```bash
+./run_ui.sh        # opens http://localhost:8501 in your browser
+```
+
+Each dataset is saved in its own folder under `outputs/`, with a `README.txt` describing every file and a
+`settings.json` holding the settings used (re-use the seed to reproduce it). The app lives in `ui/`.
+
+---
+
 ## Command structure
 
 Every simulation is run through `run_ped_sim.py`, and the feature is chosen with the **`-t`** flag. This
