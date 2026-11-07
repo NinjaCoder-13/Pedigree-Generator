@@ -113,6 +113,13 @@ consistent with Mendelian inheritance given the known relatives (e.g. `Aa/aa`), 
 joint combination, and checks the answers against the original. Results go in the problem's `solution/`
 folder. Inference is exact and done one variant at a time (`ui/problems.py`).
 
+### Evaluating LLMs on problems
+
+A separate app, `./run_llm_eval.sh` (http://localhost:8502), gives a solved problem to an LLM (Claude
+through the API, or any LLM by pasting its reply) and scores every genotype it proposes against the
+answer key: **validity**, **uniqueness** and **recovery** rates. It has its own conda environment
+(`conda env create -f llm_eval/environment.yml`). See [llm_eval/README.md](llm_eval/README.md).
+
 ---
 
 ## Command structure

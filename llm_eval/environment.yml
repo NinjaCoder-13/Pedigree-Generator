@@ -1,0 +1,12 @@
+# Conda environment for the LLM evaluation app (separate from ped_sim, which is Python 3.8).
+# Create it once with:   conda env create -f llm_eval/environment.yml
+name: llm_eval
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - streamlit==1.40.1
+      - pandas
+      - anthropic
