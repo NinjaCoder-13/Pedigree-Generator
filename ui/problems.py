@@ -19,6 +19,7 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+import json_export
 import pipeline as P
 
 ProgressFn = Callable[[float, str], None]
@@ -167,6 +168,9 @@ This dataset is a copy of "{source}" in which the genotypes of some people were 
 genotypes_letters.tsv.gz. Everything else (pedigree, profiles, relationships) is unchanged.
 
 problem.json             source dataset, removed people per family, which variants were masked
+problem_dataset.json     the whole problem in one JSON file (replaces dataset.json): settings, the
+                         problem, and per family every person, their genotype at every variant
+                         (null = removed; people have "genotype_removed": true) and relative pairs
 
 solution/  (made by "Solve" in the app; delete this folder to hand out the problem alone)
   solution_summary.csv   one row per removed person: how many variants have 1, 2 or 3 possible
@@ -180,6 +184,8 @@ solution/  (made by "Solve" in the app; delete this folder to hand out the probl
                          known genotypes around this person break Mendel's rules (a new mutation).
   family_XXX_combinations.tsv.gz   (optional) every valid joint assignment per variant
   family_XXX_answer_check.tsv.gz   true genotype next to the possible ones, per variant and person
+  solution_dataset.json  the whole solution in one JSON file: per family and variant, every removed
+                         person's possible genotypes, the true one, and (if listed) the combinations
 """
 
 
@@ -197,7 +203,7 @@ def make_problem(source: Path, masks: Dict[str, List[str]], name: str, scope: Op
     out.mkdir(parents=True)
     try:
         for f in source.iterdir():
-            if f.is_file() and f.name not in ('log.txt',):
+            if f.is_file() and f.name not in ('log.txt', json_export.DATASET_JSON):
                 shutil.copy(f, out / f.name)
         fam_dirs = sorted(d for d in source.iterdir() if d.is_dir() and d.name.startswith('family_'))
         variants, dropped = {}, {}
@@ -245,6 +251,7 @@ def make_problem(source: Path, masks: Dict[str, List[str]], name: str, scope: Op
         (out / 'settings.json').write_text(json.dumps(settings, indent=2))
         readme = (out / 'README.txt').read_text() if (out / 'README.txt').exists() else ''
         (out / 'README.txt').write_text(readme + PROBLEM_README.format(source=source.name))
+        json_export.write_dataset_json(out)
         (out / 'log.txt').write_text(
             f'[{dt.datetime.now():%H:%M:%S}] Problem made from {source.name}: removed genotypes of '
             + '; '.join(f'{f}: {", ".join(ids)}' for f, ids in masks.items()) + '\n')
@@ -496,5 +503,6 @@ def solve_problem(run_dir: Path, list_combinations: bool = False, max_combinatio
         solved=dt.datetime.now().isoformat(timespec='seconds'), list_combinations=list_combinations,
         max_combinations_per_variant=max_combinations if list_combinations else None,
         answer_check=has_truth, method='exact Mendelian consistency, one variant at a time'), indent=2))
+    json_export.write_solution_json(run_dir)
     progress(1.0, 'Done')
     return sol_dir

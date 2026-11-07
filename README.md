@@ -101,6 +101,11 @@ chromosomes, relationship tables, `.ped` files and family pictures) without usin
 Each dataset is saved in its own folder under `outputs/`, with a `README.txt` describing every file and a
 `settings.json` holding the settings used (re-use the seed to reproduce it). The app lives in `ui/`.
 
+Every dataset also gets a single JSON file covering all of its families: `dataset.json` (generated
+dataset), `problem_dataset.json` (problem dataset; removed genotypes are `null`) and
+`solution/solution_dataset.json` (every possible genotype of each removed person, per variant). To make
+them for folders created before this feature, run `python ui/json_export.py --all`.
+
 The **🧩 Pedigree problems** tab turns a dataset into a puzzle. Pick people whose genotypes should be
 removed (whole genome or part of it) and save that as a new dataset named after the original
 (`<original>__problem`). **Solve** then lists, for every removed person and variant, every genotype

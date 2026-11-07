@@ -622,6 +622,9 @@ settings.json            the exact settings used (re-use the seed to reproduce)
 all_families.ped         every family in one PED/FAM file (FID IID father mother sex phenotype)
 all_relationships.csv    every pair of relatives, all families
 log.txt                  what happened during the run
+dataset.json             everything above in one JSON file: settings, summary and, per family,
+                         every person (sex, birth year, generation, father, mother, children),
+                         their genotype at every variant (AA / Aa / aa) and the relative pairs
 
 family_XXX/
   pedigree.nx            the family tree (networkx edge list: parent child)
@@ -750,6 +753,9 @@ def run_pipeline(cfg: RunConfig, log: LogFn = print, progress: Callable[[float, 
             pd.concat(all_rel).to_csv(run_dir / 'all_relationships.csv', index=False)
         if all_ped:
             pd.concat(all_ped).to_csv(run_dir / 'all_families.ped', sep=' ', index=False, header=False)
+
+        import json_export
+        json_export.write_dataset_json(run_dir)
 
         _log(f'Finished in {time.time() - started:.1f}s. Saved to {run_dir}')
         progress(1.0, 'Done')
