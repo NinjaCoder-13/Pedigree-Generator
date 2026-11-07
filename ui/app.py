@@ -412,7 +412,7 @@ def show_solution(run_dir: Path, problem: dict):
 
     st.divider()
     d = st.columns(4)
-    if d[0].button('📦 Prepare ZIPs', key=f'ps_zip_{run_dir.name}'):
+    if d[0].button('📦 Prepare ZIPs', key=f'ps_zipbtn_{run_dir.name}'):
         st.session_state[f'ps_zip_{run_dir.name}'] = (_zip_bytes(run_dir, skip=(Q.SOLUTION_DIR,)), _zip_bytes(run_dir))
     if st.session_state.get(f'ps_zip_{run_dir.name}'):
         only, full = st.session_state[f'ps_zip_{run_dir.name}']
