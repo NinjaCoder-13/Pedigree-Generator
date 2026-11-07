@@ -10,3 +10,4 @@ dependencies:
       - streamlit==1.40.1
       - pandas
       - anthropic
+      - openai          # used to reach OpenRouter (OpenAI-compatible API)

@@ -8,14 +8,16 @@ The page has a sidebar and four tabs, which follow the order of an evaluation:
 
   sidebar        pick a problem dataset (made and solved in the Pedigree Dataset Generator app)
   1 · Prompt     see exactly what the LLM will be given, and the leak-check results
-  2 · Answer     get an answer: ask Claude through the API, or paste/upload one from any LLM
+  2 · Answer     get an answer: ask Claude, ask an OpenRouter model (e.g. DeepSeek), or
+                 paste/upload one from any LLM
   3 · Results    validity, uniqueness and recovery rates for one run, with every hypothesis
   4 · Compare    all runs of this problem side by side
 
 The heavy lifting lives in the other files:
   data.py     finding/loading problems and answer keys
   prompt.py   building the prompt + leak check
-  llm.py      calling Claude
+  llm.py      calling Claude (Anthropic API)
+  llm_openrouter.py  calling any OpenRouter model, e.g. DeepSeek V4 Flash
   scoring.py  turning a reply into hypotheses and scoring them
   runs.py     saving, re-scoring and comparing runs
 """
@@ -27,6 +29,7 @@ import streamlit as st
 
 import data as D
 import llm as L
+import llm_openrouter as LO
 import prompt as PR
 import runs as R
 
@@ -157,16 +160,51 @@ with tab_prompt:
 # ==============================================================================================
 
 with tab_answer:
-    if solution is not None and not all(p['check']['ok'] for p in parts.values()):
+    blocked = solution is not None and not all(p['check']['ok'] for p in parts.values())
+    if blocked:
+        # Not st.stop(): that would also hide the Results and Compare tabs.
         st.error('The leak check failed (tab 1), so nothing can be sent.')
-        st.stop()
-    how = st.radio('Where does the answer come from?',
-                   ['Ask Claude (Anthropic API)', 'Paste or upload an answer from any LLM'], horizontal=True)
-    label = st.text_input('Name for this run', value='', placeholder='e.g. opus-high-try1',
+    CLAUDE, OPENROUTER, MANUAL = ('Ask Claude (Anthropic API)', 'Ask a model on OpenRouter (e.g. DeepSeek)',
+                                  'Paste or upload an answer from any LLM')
+    how = st.radio('Where does the answer come from?', [CLAUDE, OPENROUTER, MANUAL], horizontal=True)
+    label = st.text_input('Name for this run', value='', placeholder='e.g. deepseek-flash-high-try1',
                           help='Shown in results and comparisons. Letters, numbers, - and _.')
 
-    # --- 2a) Claude through the API -------------------------------------------------------
-    if how.startswith('Ask Claude'):
+    def send_and_save(ask, model: str, info: dict, default_label: str):
+        """Shared by both API providers: send every part (one request, or one per family) with the
+        `ask(system, user)` function, then save and score the run. Stops at the first request that
+        fails outright (bad key, no credits, network) and saves nothing in that case."""
+        replies, prompts, results = {}, {}, {}
+        bar = st.progress(0.0, text='Starting')
+        for k, (name, p) in enumerate(parts.items()):
+            bar.progress(k / len(parts), text=f'Waiting for {model} ({name or "whole problem"})…')
+            res = ask(p['system'], p['user'])
+            results[name] = res
+            prompts[name] = PR.prompt_as_text(p['system'], p['user'])
+            replies[name] = res['text']
+            if res['stop_reason'] is None:     # the request itself failed: stop here
+                break
+        bar.progress(1.0, text='Done')
+        failed = {n: r['error'] for n, r in results.items() if r['stop_reason'] is None}
+        if failed:
+            st.error('Request failed: ' + '; '.join(f'{n or "whole problem"}: {e}' for n, e in failed.items())
+                     + ' — nothing was saved.')
+            return
+        for n, r in results.items():           # e.g. cut off at the token limit: saved, but flagged
+            if r['error']:
+                st.warning(f'{n or "Reply"}: {r["error"]}')
+        served = sorted({r['served_by'] for r in results.values() if r['served_by']})
+        info = dict(info, model=model, mode=mode, served_by=', '.join(served),
+                    stop_reasons={n: r['stop_reason'] for n, r in results.items()},
+                    input_tokens=sum(r['usage'].get('input_tokens') or 0 for r in results.values()),
+                    output_tokens=sum(r['usage'].get('output_tokens') or 0 for r in results.values()),
+                    seconds=sum(r['seconds'] for r in results.values()))
+        run_dir = R.save_run(problem_dir, label or default_label, info, prompts, replies)
+        st.session_state['selected_run'] = run_dir.name
+        st.success(f'Saved and scored as **{run_dir.name}**. See tab 3 · Results.')
+
+    # --- 2a) Claude through the Anthropic API --------------------------------------------
+    if how == CLAUDE:
         c = st.columns([2, 1, 1])
         model = c[0].selectbox('Model', L.MODELS + ['other…'])
         if model == 'other…':
@@ -177,42 +215,45 @@ with tab_answer:
                                        help='If the model declines, let the API answer with another model. '
                                             'Off by default: the answer would then not be this model\'s.')
         has_env_key = bool(os.environ.get('ANTHROPIC_API_KEY'))
-        api_key = st.text_input('API key', type='password',
+        api_key = st.text_input('Anthropic API key', type='password',
                                 placeholder='using ANTHROPIC_API_KEY from the environment' if has_env_key
                                 else 'sk-ant-…  (or set ANTHROPIC_API_KEY before starting the app)',
                                 help='Used for this request only; never saved.')
         st.caption(f'Sends {len(parts)} request(s) ({mode.lower()}). No tools are given to the model.')
+        if st.button('🚀 Ask Claude', type='primary', disabled=blocked or not model):
+            send_and_save(lambda s, u: L.ask_claude(s, u, model, effort, api_key or None, allow_fallback),
+                          model, dict(source='claude-api', effort=effort, allow_fallback=allow_fallback),
+                          f'{model}-{effort}')
 
-        if st.button('🚀 Ask Claude', type='primary', disabled=not model):
-            replies, prompts, results = {}, {}, {}
-            bar = st.progress(0.0, text='Starting')
-            for k, (name, p) in enumerate(parts.items()):
-                bar.progress(k / len(parts), text=f'Waiting for {model} ({name or "whole problem"})…')
-                res = L.ask_claude(p['system'], p['user'], model, effort, api_key or None, allow_fallback)
-                results[name] = res
-                prompts[name] = PR.prompt_as_text(p['system'], p['user'])
-                replies[name] = res['text']
-                if res['stop_reason'] is None:     # the request itself failed: stop here
-                    break
-            bar.progress(1.0, text='Done')
-            failed = {n: r['error'] for n, r in results.items() if r['stop_reason'] is None}
-            if failed:
-                st.error('Request failed: ' + '; '.join(f'{n or "whole problem"}: {e}' for n, e in failed.items())
-                         + ' — nothing was saved.')
-            else:
-                for n, r in results.items():
-                    if r['error']:
-                        st.warning(f'{n or "Reply"}: {r["error"]}')
-                served = sorted({r['served_by'] for r in results.values() if r['served_by']})
-                info = dict(source='claude-api', model=model, effort=effort, mode=mode,
-                            allow_fallback=allow_fallback, served_by=', '.join(served),
-                            stop_reasons={n: r['stop_reason'] for n, r in results.items()},
-                            input_tokens=sum(r['usage'].get('input_tokens', 0) for r in results.values()),
-                            output_tokens=sum(r['usage'].get('output_tokens', 0) for r in results.values()),
-                            seconds=sum(r['seconds'] for r in results.values()))
-                run_dir = R.save_run(problem_dir, label or f'{model}-{effort}', info, prompts, replies)
-                st.session_state['selected_run'] = run_dir.name
-                st.success(f'Saved and scored as **{run_dir.name}**. See tab 3 · Results.')
+    # --- 2b) Any model on OpenRouter (DeepSeek V4 Flash etc.) ------------------------------
+    elif how == OPENROUTER:
+        c = st.columns([2, 1, 1, 1])
+        model = c[0].selectbox('Model', LO.MODELS + ['other…'],
+                               help='deepseek/deepseek-v4-flash = DeepSeek V4 Flash. A dated ID (e.g. -0731) '
+                                    'pins one exact version, so results stay comparable later.')
+        if model == 'other…':
+            model = c[0].text_input('OpenRouter model ID', placeholder='provider/model-name')
+        effort = c[1].selectbox('Reasoning effort', LO.EFFORTS, index=LO.EFFORTS.index('high'),
+                                help='How much the model thinks before answering. "default" sends no setting.')
+        temperature = c[2].number_input('Temperature', 0.0, 2.0, 0.0, 0.1,
+                                        help='0 = most repeatable. Higher = more varied answers.')
+        seed = c[3].number_input('Seed', 0, 2**31 - 1, 0, help='Same seed + temperature 0 = as repeatable as '
+                                                               'the provider allows.')
+        max_tokens = st.number_input('Max output tokens (thinking + answer)', 1000, 400000,
+                                     LO.DEFAULT_MAX_TOKENS, 1000,
+                                     help='If replies get cut off, raise this or send one request per family.')
+        api_key = st.text_input('OpenRouter API key', type='password',
+                                placeholder='using OPENROUTER_API_KEY from the environment' if LO.api_key_from_env()
+                                else 'sk-or-…  (or set OPENROUTER_API_KEY before starting the app)',
+                                help='Used for this request only; never saved.')
+        st.caption(f'Sends {len(parts)} request(s) ({mode.lower()}) to OpenRouter. No tools are given to the '
+                   'model, and only providers that honour every setting above are used.')
+        if st.button('🚀 Ask OpenRouter', type='primary', disabled=blocked or not model):
+            send_and_save(lambda s, u: LO.ask_openrouter(s, u, model, effort, api_key or None,
+                                                         float(temperature), int(seed), int(max_tokens)),
+                          model, dict(source='openrouter', effort=effort, temperature=float(temperature),
+                                      seed=int(seed), max_tokens=int(max_tokens)),
+                          f'{model.split("/")[-1]}-{effort}')
 
     # --- 2b) Any LLM, by hand ------------------------------------------------------------
     else:
@@ -261,6 +302,7 @@ with tab_results:
 
         st.caption(f"Model: **{i.get('served_by') or i.get('model')}**"
                    + (f" · effort **{i['effort']}**" if i.get('effort') else '')
+                   + (f" · temperature {i['temperature']} · seed {i['seed']}" if 'temperature' in i else '')
                    + f" · source: {i.get('source')} · {i.get('mode', '')}"
                    + (f" · {i['input_tokens']:,} in / {i['output_tokens']:,} out tokens" if i.get('input_tokens') else ''))
         for note in m.get('parse_notes', []):

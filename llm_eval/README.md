@@ -16,10 +16,29 @@ it against the exact answer key.
 ## Running it
 
 ```bash
-conda env create -f llm_eval/environment.yml     # once; Python 3.11 + streamlit + pandas + anthropic
-export ANTHROPIC_API_KEY=sk-ant-...              # only needed to ask Claude from the app
+conda env create -f llm_eval/environment.yml     # once; Python 3.11 + streamlit + pandas + anthropic + openai
+export OPENROUTER_API_KEY=sk-or-...              # to ask OpenRouter models (e.g. DeepSeek V4 Flash)
+export ANTHROPIC_API_KEY=sk-ant-...              # to ask Claude
 ./run_llm_eval.sh                                # opens http://localhost:8502
 ```
+
+(Keys can also be typed into the app instead; they are never saved.) If the environment already
+exists from before OpenRouter support was added, update it with
+`conda env update -f llm_eval/environment.yml`.
+
+### DeepSeek V4 Flash (or any model) through OpenRouter
+
+In tab **2 · Answer** choose **Ask a model on OpenRouter**, pick `deepseek/deepseek-v4-flash`
+(or a dated version such as `deepseek/deepseek-v4-flash-0731`, which never changes, or type any
+OpenRouter model ID), and press **Ask OpenRouter**.
+
+- **Reasoning effort** (low / medium / high) sets how much the model thinks before answering.
+- **Temperature 0 + a fixed seed** (the defaults) make repeated runs as similar as the provider
+  allows; both are saved with the run.
+- **Max output tokens** includes the model's thinking. If a reply is cut off, raise it or choose
+  **One request per family** in tab 1.
+- Only OpenRouter providers that support every setting (JSON schema, seed, temperature, reasoning)
+  are used, so no setting is silently ignored.
 
 Answers from any other LLM can be pasted or uploaded instead (tab **2 · Answer**), using the prompt
 downloaded from tab **1 · Prompt**.
@@ -52,7 +71,7 @@ accept a temperature setting — which is why the reply itself is saved.)
 - **Leak check:** before anything is sent, the app confirms against the answer key that every scored
   genotype is null in the prompt, that only whitelisted fields are present, and that the prompt does
   not mention the source dataset, seed or solution. Nothing can be sent if a check fails.
-- **No tools:** Claude gets no web, code execution or files, so the prompt is all it has.
+- **No tools:** the model (Claude or OpenRouter) gets no web, code execution or files, so the prompt is all it has.
 - **No fallback by default:** a declined request is not silently answered by a different model.
 - **Results stay out of the problem:** runs are saved in `llm_eval/runs/` (git-ignored), not in the
   problem folder, so a "Problem only" ZIP from the generator never contains graded answers.
@@ -65,6 +84,7 @@ accept a temperature setting — which is why the reply itself is saved.)
 | `data.py` | Finds problems in `outputs/`, loads the problem and answer key, fingerprints them. |
 | `prompt.py` | Builds what the LLM sees, the instructions, the answer schema, and the leak check. |
 | `llm.py` | Calls Claude (streaming, structured JSON output, no tools). |
+| `llm_openrouter.py` | Calls any OpenRouter model, e.g. DeepSeek V4 Flash (same prompt, JSON schema, no tools, temperature + seed). |
 | `scoring.py` | Reads a reply, turns it into hypotheses, computes the three rates. |
 | `runs.py` | Saves runs, re-scores them, builds the comparison table. |
 

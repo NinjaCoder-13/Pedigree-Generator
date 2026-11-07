@@ -116,7 +116,7 @@ folder. Inference is exact and done one variant at a time (`ui/problems.py`).
 ### Evaluating LLMs on problems
 
 A separate app, `./run_llm_eval.sh` (http://localhost:8502), gives a solved problem to an LLM (Claude
-through the API, or any LLM by pasting its reply) and scores every genotype it proposes against the
+through the Anthropic API, any OpenRouter model such as DeepSeek V4 Flash, or any LLM by pasting its reply) and scores every genotype it proposes against the
 answer key: **validity**, **uniqueness** and **recovery** rates. It has its own conda environment
 (`conda env create -f llm_eval/environment.yml`). See [llm_eval/README.md](llm_eval/README.md).
 

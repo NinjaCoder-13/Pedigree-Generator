@@ -120,6 +120,7 @@ def leaderboard(problem_dir: Path) -> pd.DataFrame:
         i, m = r['info'], r['metrics']
         rows.append(dict(run=d.name, label=i.get('label'), source=i.get('source'),
                          model=i.get('served_by') or i.get('model'), effort=i.get('effort'),
+                         temperature=i.get('temperature'), seed=i.get('seed'),
                          validity_rate=m.get('validity_rate'), uniqueness_rate=m.get('uniqueness_rate'),
                          recovery_rate=m.get('recovery_rate'), suggested=m.get('suggested'),
                          admissible_space=m.get('admissible_space'),
