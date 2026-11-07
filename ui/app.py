@@ -492,7 +492,11 @@ with tab_new:
     # Step 1 ------------------------------------------------------------------
     step(1, 'Name your dataset')
     c = st.columns([2, 1, 1])
-    run_name = c[0].text_input('Dataset name', value=f'dataset_{dt.datetime.now():%Y%m%d_%H%M}',
+    # Default set once per session: a time-based `value=` would change every minute, and Streamlit then
+    # treats the box as a new widget and throws away whatever name was typed.
+    if 'new_run_name' not in st.session_state:
+        st.session_state['new_run_name'] = f'dataset_{dt.datetime.now():%Y%m%d_%H%M}'
+    run_name = c[0].text_input('Dataset name', key='new_run_name',
                                help='Used as the folder name inside outputs/. Spaces become underscores.')
     n_families = c[1].number_input('How many families?', 1, 500, 5,
                                    help='Each family is a separate, unrelated pedigree.')
