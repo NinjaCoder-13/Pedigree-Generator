@@ -271,13 +271,19 @@ def generation_layers(G: nx.DiGraph, prof: Optional[pd.DataFrame] = None) -> Dic
 
 
 def draw_pedigree(G: nx.DiGraph, prof: pd.DataFrame, path, title: str = '',
-                  genotypes: Optional[Dict[str, str]] = None, highlight: Optional[set] = None) -> None:
+                  genotypes: Optional[Dict[str, str]] = None, highlight: Optional[set] = None,
+                  fmt: Optional[str] = None) -> None:
     """Classic pedigree chart: partners side by side, a bar from each couple down to their children.
 
     `genotypes` (person ID -> letter genotype such as 'Aa') is written under each person.
     `highlight` (person IDs) are drawn grey, e.g. people whose genotypes were removed.
-    `path` can be a file path or a binary buffer.
+    `path` can be a file path or a binary buffer. `fmt` is 'png' or 'svg' (default: from the file
+    suffix, else png). An SVG is drawn at full scale however big the family is, so it stays sharp
+    and readable when zoomed; a PNG is capped in width and shrinks labels for big families.
     """
+    if fmt is None:
+        fmt = 'svg' if str(getattr(path, 'suffix', '')).lower() == '.svg' else 'png'
+    scalable = fmt == 'svg'
     sex = dict(zip(prof['ID'].astype(str), prof['Sex']))
     layer = generation_layers(G, prof)
     n_layers = max(layer.values()) + 1
@@ -324,11 +330,12 @@ def draw_pedigree(G: nx.DiGraph, prof: pd.DataFrame, path, title: str = '',
         for n, x in zip(ordered, xs):
             pos[n] = (x + shift, -l)
 
-    big = G.number_of_nodes() > 80
+    big = not scalable and G.number_of_nodes() > 80
     x_min = min(x for x, _ in pos.values())
     x_max = max(x for x, _ in pos.values())
     width = x_max - x_min + 1
-    fig, ax = plt.subplots(figsize=(min(max(6, width * 0.6), 60), 1.7 * n_layers + 1.2))
+    fig_w = max(6, width * 0.7) if scalable else min(max(6, width * 0.6), 60)
+    fig, ax = plt.subplots(figsize=(fig_w, 1.7 * n_layers + 1.2))
     line = dict(color='#8a94a6', lw=0.8, zorder=1, solid_capstyle='butt')
 
     sibships = {}
@@ -390,7 +397,8 @@ def draw_pedigree(G: nx.DiGraph, prof: pd.DataFrame, path, title: str = '',
     ax.legend(loc='lower right', bbox_to_anchor=(1, 1.0), ncol=3, frameon=False, fontsize=8)
     ax.set_title(title, fontsize=11, loc='left')
     fig.tight_layout()
-    fig.savefig(path, dpi=130)
+    with plt.rc_context({'svg.fonttype': 'none'}):   # keep labels as real text: crisp and searchable
+        fig.savefig(path, dpi=130, format=fmt)
     plt.close(fig)
 
 

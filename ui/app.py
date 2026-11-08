@@ -17,6 +17,7 @@ from pathlib import Path
 import networkx as nx
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pipeline as P  # noqa: E402
@@ -39,6 +40,85 @@ def step(n, title, subtitle=''):
     st.subheader(title)
     if subtitle:
         st.markdown(f'<div class="muted">{subtitle}</div>', unsafe_allow_html=True)
+
+
+# ----------------------------------------------------------------------------
+# zoomable family-tree viewer
+# ----------------------------------------------------------------------------
+
+_VIEWER = """
+<style>
+  body { margin: 0; font-family: sans-serif; }
+  .bar { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; font-size: 12px; color: #6b7280; }
+  .bar button { border: 1px solid #d1d5db; background: #fff; border-radius: 6px; padding: 2px 10px;
+                cursor: pointer; font-size: 14px; }
+  .bar a { margin-left: auto; color: #2563eb; }
+  #box { width: 100%; height: __H__px; overflow: hidden; border: 1px solid #e5e7eb; border-radius: 8px;
+         background: #fff; cursor: grab; position: relative; touch-action: none; }
+  #box:active { cursor: grabbing; }
+  #inner { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #inner svg { display: block; }
+</style>
+<div class="bar">
+  <button id="zin" title="Zoom in">+</button><button id="zout" title="Zoom out">&minus;</button>
+  <button id="fit" title="Fit the whole tree">Fit</button>
+  <span>Scroll to zoom, drag to move.</span>
+  <a id="dl" download="__NAME__.svg">Download full size</a>
+</div>
+<div id="box"><div id="inner">__SVG__</div></div>
+<script>
+  const box = document.getElementById('box'), inner = document.getElementById('inner');
+  const svg = inner.querySelector('svg');
+  const W = svg.width.baseVal.value, H = svg.height.baseVal.value;
+  let s = 1, x = 0, y = 0;
+  const apply = () => inner.style.transform = `translate(${x}px,${y}px) scale(${s})`;
+  const fit = () => {
+    s = Math.min(box.clientWidth / W, box.clientHeight / H);
+    x = (box.clientWidth - W * s) / 2; y = (box.clientHeight - H * s) / 2; apply();
+  };
+  const zoom = (f, cx, cy) => {
+    const ns = Math.min(Math.max(s * f, 0.05), 20);
+    x = cx - (cx - x) * ns / s; y = cy - (cy - y) * ns / s; s = ns; apply();
+  };
+  box.addEventListener('wheel', e => {
+    e.preventDefault();
+    const r = box.getBoundingClientRect();
+    zoom(Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top);
+  }, { passive: false });
+  let drag = null;
+  box.addEventListener('pointerdown', e => { drag = [e.clientX - x, e.clientY - y]; box.setPointerCapture(e.pointerId); });
+  box.addEventListener('pointermove', e => { if (drag) { x = e.clientX - drag[0]; y = e.clientY - drag[1]; apply(); } });
+  box.addEventListener('pointerup', () => drag = null);
+  box.addEventListener('dblclick', e => { const r = box.getBoundingClientRect(); zoom(2, e.clientX - r.left, e.clientY - r.top); });
+  document.getElementById('zin').onclick = () => zoom(1.5, box.clientWidth / 2, box.clientHeight / 2);
+  document.getElementById('zout').onclick = () => zoom(1 / 1.5, box.clientWidth / 2, box.clientHeight / 2);
+  document.getElementById('fit').onclick = fit;
+  document.getElementById('dl').href = URL.createObjectURL(
+    new Blob([new XMLSerializer().serializeToString(svg)], { type: 'image/svg+xml' }));
+  fit();
+</script>
+"""
+
+
+def show_tree(svg: bytes, caption: str = '', name: str = 'pedigree', height: int = 560):
+    """Show an SVG family tree in a box you can zoom (scroll / buttons) and drag around."""
+    text = svg.decode('utf-8')
+    text = text[text.find('<svg'):]                       # drop the XML prolog and doctype
+    html = (_VIEWER.replace('__H__', str(height)).replace('__NAME__', name)
+            .replace('__SVG__', text))
+    components.html(html, height=height + 40)
+    if caption:
+        st.caption(caption)
+
+
+@st.cache_data(show_spinner='Drawing the family tree…')
+def _plain_tree(fam_dir: str) -> bytes:
+    fam_dir = Path(fam_dir)
+    G = nx.read_edgelist(str(fam_dir / 'pedigree.nx'), create_using=nx.DiGraph())
+    prof = pd.read_csv(fam_dir / 'profiles.txt', sep='\t', dtype={'ID': str})
+    buf = io.BytesIO()
+    P.draw_pedigree(G, prof, buf, f'{fam_dir.name}  ·  {G.number_of_nodes()} people', fmt='svg')
+    return buf.getvalue()
 
 
 # ----------------------------------------------------------------------------
@@ -65,7 +145,7 @@ def _pedigree_with_genotypes(fam_dir: str, variant: int) -> bytes:
     gts = {k: v if isinstance(v, str) and v != 'NA' else '?' for k, v in row.iloc[3:].items()}
     P.draw_pedigree(G, prof, buf, f'{fam_dir.name}  ·  gene {row["GENE"]} '
                     f'(chr {row["CHROM"]}, position {row["POS"]})', genotypes=gts,
-                    highlight={k for k, v in gts.items() if v == '?'})
+                    highlight={k for k, v in gts.items() if v == '?'}, fmt='svg')
     return buf.getvalue()
 
 
@@ -123,8 +203,10 @@ def show_run(run_dir: Path, key: str):
                                   help='Writes each person\'s genotype for this variant under them: '
                                        'AA = both dominant, Aa = one of each, aa = both recessive.')
         if choice:
-            st.image(_pedigree_with_genotypes(str(fam_dir), choice - 1),
-                     caption=caption + ' Under each person: their genotype for this variant.')
+            show_tree(_pedigree_with_genotypes(str(fam_dir), choice - 1), name=f'{fam}_variant{choice}',
+                      caption=caption + ' Under each person: their genotype for this variant.')
+        elif (fam_dir / 'pedigree.nx').exists() and (fam_dir / 'profiles.txt').exists():
+            show_tree(_plain_tree(str(fam_dir)), caption=caption, name=fam)
         elif (fam_dir / 'pedigree.png').exists():
             st.image(str(fam_dir / 'pedigree.png'), caption=caption)
         else:
@@ -196,7 +278,7 @@ def _masked_tree(fam_dir: str, masked: tuple) -> bytes:
     G, prof = _family(fam_dir)
     buf = io.BytesIO()
     P.draw_pedigree(G, prof, buf, f'{Path(fam_dir).name}  ·  {len(masked)} people with genotypes removed',
-                    highlight=set(masked))
+                    highlight=set(masked), fmt='svg')
     return buf.getvalue()
 
 
@@ -217,7 +299,7 @@ def _solution_tree(fam_dir: str, sol_path: str, variant: int, masked: tuple, mti
     buf = io.BytesIO()
     P.draw_pedigree(G, prof, buf, f'{Path(fam_dir).name}  ·  gene {sol["GENE"]} (chr {sol["CHROM"]}, '
                     f'position {sol["POS"]})  ·  {sol["COMBINATIONS"]} valid combination(s)',
-                    genotypes=gts, highlight={p for p in masked if sol[p] != '-'})
+                    genotypes=gts, highlight={p for p in masked if sol[p] != '-'}, fmt='svg')
     return buf.getvalue()
 
 
@@ -276,8 +358,8 @@ def problem_maker():
         st.markdown(f'<div class="muted">{len(selected)} of {len(ids)} people chosen in {fam}.</div>',
                     unsafe_allow_html=True)
     with left:
-        st.image(_masked_tree(str(fam_dir), tuple(selected)),
-                 caption='Grey = genotypes will be removed. Squares = male, circles = female.')
+        show_tree(_masked_tree(str(fam_dir), tuple(selected)), name=f'{fam}_masked',
+                  caption='Grey = genotypes will be removed. Squares = male, circles = female.')
 
     masks = {f: sorted(store.get(f, []), key=int) for f in families if store.get(f)}
 
@@ -378,8 +460,8 @@ def show_solution(run_dir: Path, problem: dict):
     v = st.selectbox('Variant', rows, key=f'ps_var_{run_dir.name}_{fam}_{only_amb}',
                      format_func=lambda i: f'{sol["GENE"].iat[i]}  ·  chr {sol["CHROM"].iat[i]}, position '
                                            f'{sol["POS"].iat[i]}  ·  {sol["COMBINATIONS"].iat[i]} combination(s)')
-    st.image(_solution_tree(str(run_dir / fam), str(sol_path), v, masked, mtime),
-             caption='Grey = genotype was removed; the label lists every genotype that person could have '
+    show_tree(_solution_tree(str(run_dir / fam), str(sol_path), v, masked, mtime), name=f'{fam}_solution',
+              caption='Grey = genotype was removed; the label lists every genotype that person could have '
                      '(e.g. Aa/aa = Aa or aa). Others show their known genotype.')
 
     tabs = st.tabs(['🧩 Possible genotypes', '🔢 Combinations', '✅ Answer check'])
