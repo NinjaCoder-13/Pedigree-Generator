@@ -198,6 +198,7 @@ with tab_answer:
                     stop_reasons={n: r['stop_reason'] for n, r in results.items()},
                     input_tokens=sum(r['usage'].get('input_tokens') or 0 for r in results.values()),
                     output_tokens=sum(r['usage'].get('output_tokens') or 0 for r in results.values()),
+                    reasoning_tokens=sum(r['usage'].get('reasoning_tokens') or 0 for r in results.values()) or None,
                     seconds=sum(r['seconds'] for r in results.values()))
         run_dir = R.save_run(problem_dir, label or default_label, info, prompts, replies)
         st.session_state['selected_run'] = run_dir.name
@@ -234,25 +235,24 @@ with tab_answer:
         if model == 'other…':
             model = c[0].text_input('OpenRouter model ID', placeholder='provider/model-name')
         effort = c[1].selectbox('Reasoning effort', LO.EFFORTS, index=LO.EFFORTS.index('high'),
-                                help='How much the model thinks before answering. "default" sends no setting.')
+                                help='How much the model thinks before answering. Reasoning is always on; '
+                                     '"default" = the model\'s own default effort.')
         temperature = c[2].number_input('Temperature', 0.0, 2.0, 0.0, 0.1,
                                         help='0 = most repeatable. Higher = more varied answers.')
         seed = c[3].number_input('Seed', 0, 2**31 - 1, 0, help='Same seed + temperature 0 = as repeatable as '
                                                                'the provider allows.')
-        max_tokens = st.number_input('Max output tokens (thinking + answer)', 1000, 400000,
-                                     LO.DEFAULT_MAX_TOKENS, 1000,
-                                     help='If replies get cut off, raise this or send one request per family.')
         api_key = st.text_input('OpenRouter API key', type='password',
                                 placeholder='using OPENROUTER_API_KEY from the environment' if LO.api_key_from_env()
                                 else 'sk-or-…  (or set OPENROUTER_API_KEY before starting the app)',
                                 help='Used for this request only; never saved.')
         st.caption(f'Sends {len(parts)} request(s) ({mode.lower()}) to OpenRouter. No tools are given to the '
-                   'model, and only providers that honour every setting above are used.')
+                   'model, and only providers that honour every setting above are used. Reasoning is always '
+                   'on and there is no token limit; a reply without reasoning is rejected and retried on another host.')
         if st.button('🚀 Ask OpenRouter', type='primary', disabled=blocked or not model):
             send_and_save(lambda s, u: LO.ask_openrouter(s, u, model, effort, api_key or None,
-                                                         float(temperature), int(seed), int(max_tokens)),
+                                                         float(temperature), int(seed)),
                           model, dict(source='openrouter', effort=effort, temperature=float(temperature),
-                                      seed=int(seed), max_tokens=int(max_tokens)),
+                                      seed=int(seed), max_tokens=None),
                           f'{model.split("/")[-1]}-{effort}')
 
     # --- 2b) Any LLM, by hand ------------------------------------------------------------
@@ -304,7 +304,8 @@ with tab_results:
                    + (f" · effort **{i['effort']}**" if i.get('effort') else '')
                    + (f" · temperature {i['temperature']} · seed {i['seed']}" if 'temperature' in i else '')
                    + f" · source: {i.get('source')} · {i.get('mode', '')}"
-                   + (f" · {i['input_tokens']:,} in / {i['output_tokens']:,} out tokens" if i.get('input_tokens') else ''))
+                   + (f" · {i['input_tokens']:,} in / {i['output_tokens']:,} out tokens" if i.get('input_tokens') else '')
+                   + (f" ({i['reasoning_tokens']:,} reasoning)" if i.get('reasoning_tokens') else ''))
         for note in m.get('parse_notes', []):
             st.warning(f'Reading the reply: {note}')
 

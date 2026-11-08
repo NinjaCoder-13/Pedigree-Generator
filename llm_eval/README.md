@@ -32,11 +32,14 @@ In tab **2 · Answer** choose **Ask a model on OpenRouter**, pick `deepseek/deep
 (or a dated version such as `deepseek/deepseek-v4-flash-0731`, which never changes, or type any
 OpenRouter model ID), and press **Ask OpenRouter**.
 
-- **Reasoning effort** (low / medium / high) sets how much the model thinks before answering.
+- **Reasoning is always on.** **Reasoning effort** (default / low / medium / high) sets how much the
+  model thinks; "default" uses the model's own default effort. A reply that comes back without any
+  reasoning is rejected and retried with that host excluded (up to 3 tries). Reasoning tokens are
+  saved with the run and shown in tab 3.
 - **Temperature 0 + a fixed seed** (the defaults) make repeated runs as similar as the provider
   allows; both are saved with the run.
-- **Max output tokens** includes the model's thinking. If a reply is cut off, raise it or choose
-  **One request per family** in tab 1.
+- **No token limit** is sent: the model may think and answer up to the host's own maximum output
+  length. If a reply is still cut off, choose **One request per family** in tab 1.
 - Only OpenRouter providers that support every setting (JSON schema, seed, temperature, reasoning)
   are used, so no setting is silently ignored.
 
