@@ -71,6 +71,22 @@ removed genotypes answered, and one square per variant per family (🟩 complete
 out at once. Coverage counts what was answered at all; whether it was right is what the three
 rates measure.
 
+### Time and cost
+
+Every run records its **run time** (wall-clock, first request sent to last reply received), the
+**request time** (each request's own duration summed; larger than the run time when requests ran
+in parallel) and its **cost** in US dollars, plus time, cost and tokens per request. They are shown
+at the top of tab 3 (with cost per variant answered) and as `run_seconds`, `request_seconds` and
+`cost_usd` in tab 4, and tab 2 shows the time and cost so far while the requests run.
+
+- **OpenRouter:** the cost OpenRouter charged, as it reports it with each reply (looked up from its
+  generation record if a reply leaves it out). Attempts rejected for having no reasoning were paid
+  for too and are included.
+- **Claude:** estimated from the token counts and Anthropic's list prices in `llm.py` (`PRICES`,
+  dated in `PRICES_AS_OF`; update them if prices change). Thinking is billed as output tokens.
+- If some replies came back without a cost, the total is shown with a `+` (it is a lower bound).
+  Runs saved before cost tracking show `—`; pasted answers have no time or cost.
+
 Every run also records `prompt_version` (the instructions/answer format it was given), so runs made
 with different instructions are not compared by accident.
 

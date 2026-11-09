@@ -25,11 +25,16 @@ same shape as llm.ask_claude(), so the rest of the app treats both providers ali
 * NO TOKEN LIMIT: no "max_tokens" is sent, so the model can think and answer as long as the host
   allows (its own maximum output length).
 * STREAMING keeps the connection alive while the model thinks for a long time.
+* COST: OpenRouter reports what each request cost (in US dollars) with the token counts. If a
+  host leaves it out, it is looked up afterwards from OpenRouter's generation record. Attempts that
+  were rejected for having no reasoning were still paid for, so their cost is added in.
 * KEY: from the OPENROUTER_API_KEY environment variable, or typed into the app. Never written to disk.
 """
 
+import json
 import os
 import time
+import urllib.request
 from typing import Callable, Optional
 
 import openai
@@ -66,12 +71,15 @@ def ask_openrouter(system: str, user: str, model: str, effort: str = 'default',
     if not key:
         return _failed(started, 'No OpenRouter key found. Type one in, or set OPENROUTER_API_KEY '
                                 'before starting the app.')
-    excluded = []
+    excluded, spent = [], 0.0               # spent = cost of earlier, rejected attempts
     for attempt in range(MAX_ATTEMPTS):
         if attempt and on_text:
             on_text(None)
         res = _ask_once(system, user, model, effort, key, temperature, seed, excluded, started, on_text)
         host = res.pop('provider', None)
+        if res.get('cost_usd') is not None:
+            res['cost_usd'] = round(res['cost_usd'] + spent, 6)
+        spent = res.get('cost_usd') or spent
         if res['stop_reason'] is None or res.pop('reasoned'):
             if excluded and res['stop_reason'] is not None:
                 res['error'] = (res['error'] + ' ' if res['error'] else '') + \
@@ -95,7 +103,7 @@ def _ask_once(system: str, user: str, model: str, effort: str, key: str, tempera
     reasoning = {'enabled': True}
     if effort != 'default':
         reasoning['effort'] = effort
-    extra = {'provider': provider_opts, 'reasoning': reasoning}
+    extra = {'provider': provider_opts, 'reasoning': reasoning}   # the cost always comes with the usage
 
     try:
         client = openai.OpenAI(base_url=BASE_URL, api_key=key, timeout=1800)
@@ -111,8 +119,9 @@ def _ask_once(system: str, user: str, model: str, effort: str, key: str, tempera
             extra_body=extra,
         )
         # Collect the streamed answer piece by piece.
-        parts, finish, served, usage, host, reasoning_chars = [], None, None, {}, None, 0
+        parts, finish, served, usage, host, reasoning_chars, gen_id, cost = [], None, None, {}, None, 0, None, None
         for chunk in stream:
+            gen_id = gen_id or getattr(chunk, 'id', None)
             served = served or getattr(chunk, 'model', None)
             provider = getattr(chunk, 'provider', None) or (chunk.model_extra or {}).get('provider')
             if provider:
@@ -122,6 +131,10 @@ def _ask_once(system: str, user: str, model: str, effort: str, key: str, tempera
                 details = getattr(chunk.usage, 'completion_tokens_details', None)
                 usage = dict(input_tokens=chunk.usage.prompt_tokens, output_tokens=chunk.usage.completion_tokens,
                              reasoning_tokens=getattr(details, 'reasoning_tokens', None) if details else None)
+                reported = getattr(chunk.usage, 'cost', None)
+                if reported is None:
+                    reported = (chunk.usage.model_extra or {}).get('cost')
+                cost = float(reported) if reported is not None else cost
             for choice in chunk.choices or []:
                 if choice.delta and choice.delta.content:
                     parts.append(choice.delta.content)
@@ -160,10 +173,30 @@ def _ask_once(system: str, user: str, model: str, effort: str, key: str, tempera
     elif finish is None:
         note = 'The stream ended without a finish reason; the reply may be incomplete.'
     reasoned = bool(reasoning_chars) or bool(usage.get('reasoning_tokens'))
+    seconds = round(time.time() - started, 1)     # measured before the cost lookup below
+    if cost is None and gen_id:
+        cost = _generation_cost(gen_id, key)
     return dict(text=''.join(parts), stop_reason=stop or 'unknown', served_by=served or model, usage=usage,
-                seconds=round(time.time() - started, 1), error=note, reasoned=reasoned, provider=host)
+                seconds=seconds, error=note, reasoned=reasoned, provider=host, cost_usd=cost,
+                cost_source='reported by OpenRouter' if cost is not None else None, request_id=gen_id)
+
+
+def _generation_cost(gen_id: str, key: str, tries: int = 3) -> Optional[float]:
+    """The cost OpenRouter recorded for one request (its stats can take a moment to appear)."""
+    for k in range(tries):
+        try:
+            req = urllib.request.Request(f'{BASE_URL}/generation?id={gen_id}',
+                                         headers={'Authorization': f'Bearer {key}'})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                total = (json.loads(r.read()).get('data') or {}).get('total_cost')
+            if total is not None:
+                return float(total)
+        except Exception:
+            pass
+        time.sleep(1.5 * (k + 1))
+    return None
 
 
 def _failed(started: float, message: str) -> dict:
     return dict(text='', stop_reason=None, served_by=None, usage={}, seconds=round(time.time() - started, 1),
-                error=message)
+                error=message, cost_usd=None, cost_source=None)

@@ -57,6 +57,19 @@ def fmt_pct(x) -> str:
     return '—' if x is None or (isinstance(x, float) and pd.isna(x)) else f'{x:.2f}%'
 
 
+def fmt_usd(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return '—'
+    return f'${x:,.4f}' if x < 1 else f'${x:,.2f}'
+
+
+def fmt_time(sec) -> str:
+    if sec is None or (isinstance(sec, float) and pd.isna(sec)):
+        return '—'
+    sec = int(round(sec))
+    return f'{sec // 3600}h {sec % 3600 // 60:02d}m' if sec >= 3600 else f'{sec // 60}m {sec % 60:02d}s'
+
+
 # ==============================================================================================
 # Sidebar — choose the problem
 # ==============================================================================================
@@ -235,8 +248,10 @@ with tab_answer:
             covered = len(seen & {(f, v) for f, v, _ in TARGETS})
             bar.progress(min(covered / max(len(TARGETS), 1), 1.0),
                          text=f'Variants answered so far: {covered:,} / {len(TARGETS):,}')
+            spent = sum(r.get('cost_usd') or 0 for r in results.values())
             status.caption(f'Waiting for {model} · requests: {len(results):,} / {len(names):,} done, '
-                           f'{running} running · {time.time() - started:,.0f} s')
+                           f'{running} running · {fmt_time(time.time() - started)} so far · '
+                           f'cost of finished requests {fmt_usd(spent)}')
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             queue, pending, stop = iter(names), {}, False
@@ -275,6 +290,11 @@ with tab_answer:
             if r['error']:
                 st.warning(f'{n or "Reply"}: {r["error"]}')
         served = sorted({r['served_by'] for r in ok.values() if r['served_by']})
+        # Cost: summed over every request that came back (failed ones usually cost nothing). If any
+        # reply has no cost, the total is a lower bound and is flagged as such.
+        costs = [r.get('cost_usd') for r in results.values() if r['stop_reason'] is not None]
+        known = [c for c in costs if c is not None]
+        sources = sorted({r['cost_source'] for r in results.values() if r.get('cost_source')})
         info = dict(info, model=model, mode=mode, prompt_version=PR.PROMPT_VERSION, served_by=', '.join(served),
                     requests=len(names), parallel=workers,
                     stop_reasons={n: r['stop_reason'] for n, r in ok.items()},
@@ -283,13 +303,21 @@ with tab_answer:
                     output_tokens=sum(r['usage'].get('output_tokens') or 0 for r in ok.values()),
                     reasoning_tokens=sum(r['usage'].get('reasoning_tokens') or 0 for r in ok.values()) or None,
                     seconds=sum(r['seconds'] for r in ok.values()),
-                    wall_seconds=round(time.time() - started, 1))
+                    wall_seconds=round(time.time() - started, 1),
+                    cost_usd=round(sum(known), 6) if known else None,
+                    cost_complete=len(known) == len(costs), cost_source=', '.join(sources) or None,
+                    per_request={n: dict(seconds=r['seconds'], cost_usd=r.get('cost_usd'),
+                                         input_tokens=r['usage'].get('input_tokens'),
+                                         output_tokens=r['usage'].get('output_tokens'),
+                                         stop_reason=r['stop_reason'], request_id=r.get('request_id'))
+                                 for n, r in results.items()})
         prompts = {n: PR.prompt_as_text(parts[n]['system'], parts[n]['user']) for n in ok}
         run_dir = R.save_run(problem_dir, label or default_label, info, prompts, {n: r['text'] for n, r in ok.items()})
         st.session_state['selected_run'] = run_dir.name
         m = R.load_run(run_dir)['metrics']
         st.success(f'Saved and scored as **{run_dir.name}** · variants answered: **{R.coverage_text(m)}** · '
-                   f'recovery {fmt_pct(m["recovery_rate"])}. See tab 3 · Results.')
+                   f'recovery {fmt_pct(m["recovery_rate"])} · took {fmt_time(info["wall_seconds"])} · '
+                   f'cost {fmt_usd(info["cost_usd"])}. See tab 3 · Results.')
 
     # --- 2a) Claude through the Anthropic API --------------------------------------------
     if how == CLAUDE:
@@ -400,6 +428,29 @@ with tab_results:
         if i.get('failed_parts'):
             st.error(f"{len(i['failed_parts'])} of {i.get('requests', '?')} requests failed or were not sent; "
                      'their variants count as unanswered.')
+
+        # Time and cost of getting the answer.
+        if i.get('source') != 'manual':
+            c = st.columns(4)
+            c[0].metric('Run time', fmt_time(i.get('wall_seconds', i.get('seconds'))),
+                        help='From the first request sent to the last reply received (wall-clock). '
+                             'Older runs only recorded the summed request time, shown here instead.')
+            c[1].metric('Request time (summed)', fmt_time(i.get('seconds')),
+                        help='Every request\'s own duration added up. Larger than the run time when '
+                             'requests ran in parallel.')
+            c[2].metric('Cost', fmt_usd(i.get('cost_usd')) + ('' if i.get('cost_complete', True) else ' +'),
+                        help=(i.get('cost_source') or 'Not recorded for this run.') +
+                             ('' if i.get('cost_complete', True) else ' Some replies had no cost, so the real '
+                                                                      'total is higher.'))
+            n_req = i.get('requests') or len(i.get('parts') or [1])
+            c[3].metric('Cost per variant answered',
+                        fmt_usd(i['cost_usd'] / m['variants_complete'])
+                        if i.get('cost_usd') is not None and m.get('variants_complete') else '—',
+                        help=f'{n_req:,} request(s). Cost divided by the variants fully answered.')
+            if i.get('per_request') and len(i['per_request']) > 1:
+                with st.expander('Time and cost per request'):
+                    pr = pd.DataFrame([dict(request=k, **v) for k, v in i['per_request'].items()])
+                    st.dataframe(pr, hide_index=True, use_container_width=True, height=260)
 
         # Coverage first: how much of the problem the LLM answered at all (right or wrong).
         st.subheader('Coverage')

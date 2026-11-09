@@ -133,6 +133,9 @@ def leaderboard(problem_dir: Path) -> pd.DataFrame:
                          recovery_rate=m.get('recovery_rate'), suggested=m.get('suggested'),
                          admissible_space=m.get('admissible_space'),
                          failed_requests=len(i.get('failed_parts') or {}),
+                         run_seconds=i.get('wall_seconds', i.get('seconds')), request_seconds=i.get('seconds'),
+                         cost_usd=i.get('cost_usd'), cost_complete=i.get('cost_complete'),
+                         output_tokens=i.get('output_tokens'),
                          up_to_date=m.get('solution_fingerprint') == D.solution_fingerprint(problem_dir)))
     return pd.DataFrame(rows)
 
