@@ -30,7 +30,7 @@ same shape as llm.ask_claude(), so the rest of the app treats both providers ali
 
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import openai
 
@@ -52,20 +52,25 @@ def api_key_from_env() -> Optional[str]:
 
 
 def ask_openrouter(system: str, user: str, model: str, effort: str = 'default',
-                   api_key: Optional[str] = None, temperature: float = 0.0, seed: int = 0) -> dict:
+                   api_key: Optional[str] = None, temperature: float = 0.0, seed: int = 0,
+                   on_text: Optional[Callable[[str], None]] = None) -> dict:
     """Send one request. Returns the same keys as llm.ask_claude():
          text, stop_reason ('end_turn' when finished normally, 'max_tokens' when cut off),
          served_by (the model and hosting provider that answered), usage (incl. reasoning_tokens),
          seconds, error
-    A reply without any reasoning is rejected and retried with that host excluded."""
+    A reply without any reasoning is rejected and retried with that host excluded.
+    `on_text`, if given, is called with each new piece of the answer as it streams in, and with None
+    when a rejected attempt is retried (so whatever it collected so far should be thrown away)."""
     started = time.time()
     key = api_key or api_key_from_env()
     if not key:
         return _failed(started, 'No OpenRouter key found. Type one in, or set OPENROUTER_API_KEY '
                                 'before starting the app.')
     excluded = []
-    for _ in range(MAX_ATTEMPTS):
-        res = _ask_once(system, user, model, effort, key, temperature, seed, excluded, started)
+    for attempt in range(MAX_ATTEMPTS):
+        if attempt and on_text:
+            on_text(None)
+        res = _ask_once(system, user, model, effort, key, temperature, seed, excluded, started, on_text)
         host = res.pop('provider', None)
         if res['stop_reason'] is None or res.pop('reasoned'):
             if excluded and res['stop_reason'] is not None:
@@ -80,7 +85,7 @@ def ask_openrouter(system: str, user: str, model: str, effort: str = 'default',
 
 
 def _ask_once(system: str, user: str, model: str, effort: str, key: str, temperature: float, seed: int,
-              excluded: list, started: float) -> dict:
+              excluded: list, started: float, on_text=None) -> dict:
     """One streamed request. Adds 'reasoned' (did the model think?) and 'provider' to the result."""
     # OpenRouter-specific options go in "extra_body" (they are not part of OpenAI's own API).
     # Reasoning is always switched on; with require_parameters, only hosts that support it are used.
@@ -120,6 +125,8 @@ def _ask_once(system: str, user: str, model: str, effort: str, key: str, tempera
             for choice in chunk.choices or []:
                 if choice.delta and choice.delta.content:
                     parts.append(choice.delta.content)
+                    if on_text:
+                        on_text(choice.delta.content)
                 if choice.delta:                     # the thinking arrives as "reasoning" (not saved)
                     thought = (choice.delta.model_extra or {}).get('reasoning')
                     if thought:

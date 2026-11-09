@@ -39,9 +39,40 @@ OpenRouter model ID), and press **Ask OpenRouter**.
 - **Temperature 0 + a fixed seed** (the defaults) make repeated runs as similar as the provider
   allows; both are saved with the run.
 - **No token limit** is sent: the model may think and answer up to the host's own maximum output
-  length. If a reply is still cut off, choose **One request per family** in tab 1.
+  length.
 - Only OpenRouter providers that support every setting (JSON schema, seed, temperature, reasoning)
   are used, so no setting is silently ignored.
+
+### Big problems: how to send them (tab 1)
+
+A model asked for a very long answer often stops early on purpose: it answers one or a few
+variants, closes the JSON and ends normally (no "cut off" warning). Two things help:
+
+- **The answer format is compact.** The model writes one entry per variant and groups the people
+  who have the same list of possible genotypes:
+  `{"family": "family_001", "variant": "1:446", "groups": [{"genotypes": ["RR", "Rr"], "individuals": ["2", "7"]}, …]}`.
+  That is about 10× shorter than one entry per person (the format of prompt version 1, which is
+  still read when scoring old runs or pasted answers).
+- **Optionally, split the problem.** *One request per family*, or *One request per variant* (each
+  request then contains one family's pedigree and a single variant, so every reply is short).
+  **Requests sent at the same time** (tab 2, default 4) runs several requests in parallel. If a
+  request fails outright (e.g. rate limit, no credits), no new ones are started, and the replies
+  that did arrive are saved; the rest count as unanswered.
+
+Tab 1 shows how many variants and removed genotypes the answer must cover, and the size of the
+largest request.
+
+### Coverage: how much of the problem was answered
+
+While the requests run, tab 2 shows live **Variants answered so far: N / total**, read from the
+streamed reply. Tab 3 then starts with **Coverage**: variants fully / partly / not answered,
+removed genotypes answered, and one square per variant per family (🟩 complete · 🟨 partly ·
+⬜ not answered). Tab 4 lists `variants_covered` for every run, so runs that stopped early stand
+out at once. Coverage counts what was answered at all; whether it was right is what the three
+rates measure.
+
+Every run also records `prompt_version` (the instructions/answer format it was given), so runs made
+with different instructions are not compared by accident.
 
 Answers from any other LLM can be pasted or uploaded instead (tab **2 · Answer**), using the prompt
 downloaded from tab **1 · Prompt**.
@@ -92,5 +123,7 @@ accept a temperature setting — which is why the reply itself is saved.)
 | `runs.py` | Saves runs, re-scores them, builds the comparison table. |
 
 Each saved run (`llm_eval/runs/<problem>/<time>_<label>/`) holds the exact prompt and reply,
-`metrics.json`, `hypotheses.csv` (every suggestion with its verdict), `per_family.csv` and
-`missed.csv` (admissible hypotheses the LLM did not find).
+`metrics.json`, `hypotheses.csv` (every suggestion with its verdict), `per_family.csv`,
+`coverage.csv` (per variant: removed genotypes answered, and complete / partial / missing) and
+`missed.csv` (admissible hypotheses the LLM did not find). A split run has one
+`prompt_<part>.txt` / `reply_<part>.txt` per request.

@@ -8,12 +8,15 @@ Every evaluation is saved as a folder so it can be inspected, re-scored and comp
         run.json            who/what/when: model, effort, how the answer was obtained, fingerprints
                             of the problem and answer key, token usage
         prompt.txt          the exact text sent (system + user prompt) — for one-request runs
-        prompt_<family>.txt the exact text sent per family — for one-family-per-request runs
-        reply.txt / reply_<family>.txt
+        prompt_<part>.txt   the exact text sent per request — when the problem was split, <part> is
+                            the family (one request per family) or <family>__<chrom>-<pos> (one
+                            request per variant)
+        reply.txt / reply_<part>.txt
                             the exact reply text(s) from the LLM, unchanged
         metrics.json        the three rates and every count behind them
         hypotheses.csv      one row per suggested hypothesis with its verdict
-        per_family.csv      the rates per family
+        per_family.csv      the rates (and variant coverage) per family
+        coverage.csv        one row per variant: how many of its removed genotypes were answered
         missed.csv          admissible hypotheses the LLM did not find
 
 WHY OUTSIDE outputs/<problem>/ ?  The generator app zips a problem for handing out ("Problem only").
@@ -97,6 +100,7 @@ def rescore(problem_dir: Path, run_dir: Path) -> dict:
     metrics['scored'] = dt.datetime.now().isoformat(timespec='seconds')
     (run_dir / 'metrics.json').write_text(json.dumps(metrics, indent=2))
     hyps.to_csv(run_dir / 'hypotheses.csv', index=False)
+    S.variant_coverage(entries, solution).to_csv(run_dir / 'coverage.csv', index=False)
     per_fam.to_csv(run_dir / 'per_family.csv', index=False)
     S.missed_hypotheses(hyps, solution).to_csv(run_dir / 'missed.csv', index=False)
     return metrics
@@ -106,7 +110,7 @@ def load_run(run_dir: Path) -> dict:
     """Everything about a saved run, for display."""
     out = dict(dir=run_dir, info=json.loads((run_dir / 'run.json').read_text()))
     out['metrics'] = json.loads((run_dir / 'metrics.json').read_text()) if (run_dir / 'metrics.json').exists() else {}
-    for name in ('hypotheses', 'per_family', 'missed'):
+    for name in ('hypotheses', 'per_family', 'missed', 'coverage'):
         p = run_dir / f'{name}.csv'
         out[name] = pd.read_csv(p, dtype={'individual': str, 'variant': str}) if p.exists() else pd.DataFrame()
     return out
@@ -121,8 +125,21 @@ def leaderboard(problem_dir: Path) -> pd.DataFrame:
         rows.append(dict(run=d.name, label=i.get('label'), source=i.get('source'),
                          model=i.get('served_by') or i.get('model'), effort=i.get('effort'),
                          temperature=i.get('temperature'), seed=i.get('seed'),
+                         mode=i.get('mode'), prompt_version=i.get('prompt_version', 1),
+                         variants_covered=coverage_text(m),
+                         variants_complete=m.get('variants_complete'), variants_total=m.get('variants_total'),
+                         cells_answered=m.get('cells_answered'), cells=m.get('cells'),
                          validity_rate=m.get('validity_rate'), uniqueness_rate=m.get('uniqueness_rate'),
                          recovery_rate=m.get('recovery_rate'), suggested=m.get('suggested'),
                          admissible_space=m.get('admissible_space'),
+                         failed_requests=len(i.get('failed_parts') or {}),
                          up_to_date=m.get('solution_fingerprint') == D.solution_fingerprint(problem_dir)))
     return pd.DataFrame(rows)
+
+
+def coverage_text(m: dict) -> str:
+    """E.g. "57 / 148 (+2 partial)" — variants fully answered out of all variants to answer."""
+    if m.get('variants_total') is None:
+        return '— (re-score)'
+    extra = f" (+{m['variants_partial']} partial)" if m.get('variants_partial') else ''
+    return f"{m['variants_complete']} / {m['variants_total']}{extra}"

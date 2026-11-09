@@ -23,7 +23,7 @@ record of what happened (model, stop reason, token usage). Things to know:
 """
 
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import anthropic
 
@@ -36,14 +36,16 @@ MAX_TOKENS = 64000          # room for long thinking + a long JSON answer
 
 
 def ask_claude(system: str, user: str, model: str, effort: str, api_key: Optional[str] = None,
-               allow_fallback: bool = False) -> dict:
+               allow_fallback: bool = False, on_text: Optional[Callable[[str], None]] = None) -> dict:
     """Send one request. Returns a dict with:
          text           the reply (JSON text), '' if there was none
          stop_reason    'end_turn' when finished normally; 'max_tokens' = cut off; 'refusal' = declined
          served_by      the model that actually produced the answer
          usage          input/output token counts
          seconds        how long it took
-         error          an error message, or None"""
+         error          an error message, or None
+    `on_text`, if given, is called with each new piece of the answer as it streams in (the app uses
+    it to show live how many variants have been answered)."""
     request = dict(
         model=model,
         max_tokens=MAX_TOKENS,
@@ -62,10 +64,10 @@ def ask_claude(system: str, user: str, model: str, effort: str, api_key: Optiona
             # fallback model. Off by default (see the note at the top of this file).
             with client.beta.messages.stream(betas=['server-side-fallback-2026-07-01'],
                                              fallbacks='default', **request) as stream:
-                msg = stream.get_final_message()
+                msg = _consume(stream, on_text)
         else:
             with client.messages.stream(**request) as stream:
-                msg = stream.get_final_message()
+                msg = _consume(stream, on_text)
     # Most specific errors first, so the message shown in the app says what to do.
     except anthropic.AuthenticationError:
         return _failed(started, 'The API key was rejected. Check ANTHROPIC_API_KEY or the key you typed.')
@@ -99,6 +101,14 @@ def ask_claude(system: str, user: str, model: str, effort: str, api_key: Optiona
         note = 'The reply was cut off at the token limit; it may be incomplete or unreadable.'
     return dict(text=text, stop_reason=msg.stop_reason, served_by=msg.model, usage=usage,
                 seconds=round(time.time() - started, 1), error=note)
+
+
+def _consume(stream, on_text):
+    """Read the stream to the end, passing each piece of answer text to on_text."""
+    if on_text:
+        for piece in stream.text_stream:
+            on_text(piece)
+    return stream.get_final_message()
 
 
 def _failed(started: float, message: str) -> dict:

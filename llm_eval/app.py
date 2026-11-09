@@ -9,8 +9,9 @@ The page has a sidebar and four tabs, which follow the order of an evaluation:
   sidebar        pick a problem dataset (made and solved in the Pedigree Dataset Generator app)
   1 · Prompt     see exactly what the LLM will be given, and the leak-check results
   2 · Answer     get an answer: ask Claude, ask an OpenRouter model (e.g. DeepSeek), or
-                 paste/upload one from any LLM
-  3 · Results    validity, uniqueness and recovery rates for one run, with every hypothesis
+                 paste/upload one from any LLM; shows live how many variants are answered
+  3 · Results    coverage (which variants were answered), then validity, uniqueness and recovery
+                 rates for one run, with every hypothesis
   4 · Compare    all runs of this problem side by side
 
 The heavy lifting lives in the other files:
@@ -23,6 +24,8 @@ The heavy lifting lives in the other files:
 """
 
 import os
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 import pandas as pd
 import streamlit as st
@@ -32,11 +35,14 @@ import llm as L
 import llm_openrouter as LO
 import prompt as PR
 import runs as R
+import scoring as S
 
 st.set_page_config(page_title='LLM Genotype Evaluation', page_icon='🧪', layout='wide')
 
 ONE_REQUEST = 'One request for the whole problem'
 PER_FAMILY = 'One request per family'
+PER_VARIANT = 'One request per variant'
+MODES = [ONE_REQUEST, PER_FAMILY, PER_VARIANT]
 
 METRIC_HELP = {
     'validity': 'Of every hypothesis the LLM suggested (repeats included), the % that are admissible '
@@ -92,18 +98,32 @@ tab_prompt, tab_answer, tab_results, tab_compare = st.tabs(
 # ==============================================================================================
 # Building the prompt(s)
 # ==============================================================================================
-# A problem can be sent as one request, or split into one request per family (smaller prompts and
-# replies; each family is solved independently anyway, so nothing is lost by splitting).
-# `parts` maps a part name ('' for the single request, else the family name) to its prompt.
+# A problem can be sent as one request, or split into one request per family, or one per variant
+# (smaller prompts and much shorter replies; every family and every variant is solved on its own
+# anyway, so nothing is lost by splitting). `parts` maps a part name to its prompt:
+#   ''                         the single request
+#   'family_001'               one family (all its variants)
+#   'family_001__1-331'        one variant of one family (file-name safe: ':' becomes '-')
+# Only variants with at least one removed genotype get a request of their own.
+TARGETS = PR.targets(problem)          # [(family, variant, removed genotypes), ...]
+
 
 def make_parts(mode: str) -> dict:
-    fams = [f['family'] for f in problem['families']]
-    groups = {'': None} if mode == ONE_REQUEST else {f: [f] for f in fams}
+    if mode == ONE_REQUEST:
+        groups = {'': (None, None)}
+    elif mode == PER_FAMILY:
+        groups = {f['family']: ([f['family']], None) for f in problem['families']}
+    else:
+        groups = {f'{fam}__{vid.replace(":", "-")}': ([fam], [vid]) for fam, vid, _ in TARGETS}
     parts = {}
-    for name, only in groups.items():
-        system, user, view = PR.build_prompt(problem, only)
+    for name, (fams, variants) in groups.items():
+        system, user, view = PR.build_prompt(problem, fams, variants)
         check = PR.leak_check(view, PR.prompt_as_text(system, user), problem, solution) if solution else None
-        parts[name] = dict(system=system, user=user, view=view, check=check)
+        cells = sum(g is None for f in view for v in f['variants'] for g in v['genotypes'].values())
+        parts[name] = dict(system=system, user=user, view=view, check=check, cells=cells,
+                           variants=sum(1 for f in view for v in f['variants']
+                                        if any(g is None for g in v['genotypes'].values())),
+                           family=fams[0] if fams and len(fams) == 1 else '')
     return parts
 
 
@@ -112,10 +132,16 @@ def make_parts(mode: str) -> dict:
 # ==============================================================================================
 
 with tab_prompt:
-    mode = st.radio('How to send the problem', [ONE_REQUEST, PER_FAMILY], horizontal=True, key='mode',
-                    help='Splitting by family keeps every request and reply small. '
-                         'Pasting into a chat by hand works best with one request.')
+    mode = st.radio('How to send the problem', MODES, horizontal=True, key='mode',
+                    help='Splitting keeps every request and reply small. A model that has to write a '
+                         'very long answer often stops after a few variants; one request per variant '
+                         'avoids that. Pasting into a chat by hand works best with one request.')
     parts = make_parts(mode)
+    n_cells = sum(n for *_, n in TARGETS)
+    biggest = max(parts.values(), key=lambda p: p['cells'])
+    st.caption(f'The answer has to cover **{len(TARGETS):,}** variants with **{n_cells:,}** removed genotypes. '
+               f'{len(parts):,} request(s); the largest asks for {biggest["cells"]:,} genotypes in '
+               f'{biggest["variants"]:,} variant(s).')
 
     # Leak check summary (one line per test; all parts must pass).
     st.subheader('Leak check')
@@ -170,39 +196,100 @@ with tab_answer:
     label = st.text_input('Name for this run', value='', placeholder='e.g. deepseek-flash-high-try1',
                           help='Shown in results and comparisons. Letters, numbers, - and _.')
 
+    workers = 1
+    if how != MANUAL and len(parts) > 1:
+        workers = int(st.number_input('Requests sent at the same time', 1, 16, 4,
+                                      help='Requests run in parallel to save time. Lower it if the provider '
+                                           'reports rate limits.'))
+
     def send_and_save(ask, model: str, info: dict, default_label: str):
-        """Shared by both API providers: send every part (one request, or one per family) with the
-        `ask(system, user)` function, then save and score the run. Stops at the first request that
-        fails outright (bad key, no credits, network) and saves nothing in that case."""
-        replies, prompts, results = {}, {}, {}
-        bar = st.progress(0.0, text='Starting')
-        for k, (name, p) in enumerate(parts.items()):
-            bar.progress(k / len(parts), text=f'Waiting for {model} ({name or "whole problem"})…')
-            res = ask(p['system'], p['user'])
-            results[name] = res
-            prompts[name] = PR.prompt_as_text(p['system'], p['user'])
-            replies[name] = res['text']
-            if res['stop_reason'] is None:     # the request itself failed: stop here
-                break
-        bar.progress(1.0, text='Done')
+        """Shared by both API providers: send every part (one request, or one per family / variant)
+        with `ask(system, user, on_text)`, `workers` at a time, then save and score the run.
+
+        While the requests run, the page shows live how many variants the replies have started to
+        answer (read from the streamed text). If a request fails outright (bad key, no credits,
+        network), no new requests are started; the replies that did arrive are still saved and the
+        failed requests are recorded with the run. Nothing is saved if every request failed."""
+        names = list(parts)
+        live = {n: [] for n in names}              # streamed answer pieces per part (worker threads append)
+
+        def collector(name):
+            def on_text(piece):
+                if piece is None:                    # the provider retried: start this part again
+                    live[name].clear()
+                else:
+                    live[name].append(piece)
+            return on_text
+
+        def run_one(name):
+            p = parts[name]
+            return ask(p['system'], p['user'], collector(name))
+
+        bar, status = st.progress(0.0, text='Starting'), st.empty()
+        results, started = {}, time.time()
+
+        def show_progress(running: int):
+            seen = set()
+            for n in names:
+                seen |= S.variants_in_text(''.join(live[n]), parts[n]['family'])
+            covered = len(seen & {(f, v) for f, v, _ in TARGETS})
+            bar.progress(min(covered / max(len(TARGETS), 1), 1.0),
+                         text=f'Variants answered so far: {covered:,} / {len(TARGETS):,}')
+            status.caption(f'Waiting for {model} · requests: {len(results):,} / {len(names):,} done, '
+                           f'{running} running · {time.time() - started:,.0f} s')
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            queue, pending, stop = iter(names), {}, False
+            while True:
+                while not stop and len(pending) < workers:
+                    name = next(queue, None)
+                    if name is None:
+                        break
+                    pending[pool.submit(run_one, name)] = name
+                if not pending:
+                    break
+                done, _ = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    name = pending.pop(fut)
+                    try:
+                        results[name] = fut.result()
+                    except Exception as e:           # never lose the other replies to one crash
+                        results[name] = dict(text='', stop_reason=None, served_by=None, usage={},
+                                             seconds=0.0, error=f'{type(e).__name__}: {e}')
+                    if results[name]['stop_reason'] is None:
+                        stop = True                  # e.g. bad key / no credits: start no new requests
+                show_progress(len(pending))
+
         failed = {n: r['error'] for n, r in results.items() if r['stop_reason'] is None}
-        if failed:
-            st.error('Request failed: ' + '; '.join(f'{n or "whole problem"}: {e}' for n, e in failed.items())
+        ok = {n: r for n, r in results.items() if r['stop_reason'] is not None}
+        not_sent = [n for n in names if n not in results]
+        if not ok:
+            st.error('Request failed: ' + '; '.join(f'{n or "whole problem"}: {e}' for n, e in list(failed.items())[:3])
                      + ' — nothing was saved.')
             return
-        for n, r in results.items():           # e.g. cut off at the token limit: saved, but flagged
+        if failed or not_sent:
+            st.error(f'{len(failed)} request(s) failed and {len(not_sent)} were not sent (first error: '
+                     f'{next(iter(failed.values()))}). The {len(ok)} replies that arrived are saved; '
+                     'the rest count as unanswered.')
+        for n, r in ok.items():                 # e.g. cut off at the token limit: saved, but flagged
             if r['error']:
                 st.warning(f'{n or "Reply"}: {r["error"]}')
-        served = sorted({r['served_by'] for r in results.values() if r['served_by']})
-        info = dict(info, model=model, mode=mode, served_by=', '.join(served),
-                    stop_reasons={n: r['stop_reason'] for n, r in results.items()},
-                    input_tokens=sum(r['usage'].get('input_tokens') or 0 for r in results.values()),
-                    output_tokens=sum(r['usage'].get('output_tokens') or 0 for r in results.values()),
-                    reasoning_tokens=sum(r['usage'].get('reasoning_tokens') or 0 for r in results.values()) or None,
-                    seconds=sum(r['seconds'] for r in results.values()))
-        run_dir = R.save_run(problem_dir, label or default_label, info, prompts, replies)
+        served = sorted({r['served_by'] for r in ok.values() if r['served_by']})
+        info = dict(info, model=model, mode=mode, prompt_version=PR.PROMPT_VERSION, served_by=', '.join(served),
+                    requests=len(names), parallel=workers,
+                    stop_reasons={n: r['stop_reason'] for n, r in ok.items()},
+                    failed_parts=dict(failed, **{n: 'not sent' for n in not_sent}) or None,
+                    input_tokens=sum(r['usage'].get('input_tokens') or 0 for r in ok.values()),
+                    output_tokens=sum(r['usage'].get('output_tokens') or 0 for r in ok.values()),
+                    reasoning_tokens=sum(r['usage'].get('reasoning_tokens') or 0 for r in ok.values()) or None,
+                    seconds=sum(r['seconds'] for r in ok.values()),
+                    wall_seconds=round(time.time() - started, 1))
+        prompts = {n: PR.prompt_as_text(parts[n]['system'], parts[n]['user']) for n in ok}
+        run_dir = R.save_run(problem_dir, label or default_label, info, prompts, {n: r['text'] for n, r in ok.items()})
         st.session_state['selected_run'] = run_dir.name
-        st.success(f'Saved and scored as **{run_dir.name}**. See tab 3 · Results.')
+        m = R.load_run(run_dir)['metrics']
+        st.success(f'Saved and scored as **{run_dir.name}** · variants answered: **{R.coverage_text(m)}** · '
+                   f'recovery {fmt_pct(m["recovery_rate"])}. See tab 3 · Results.')
 
     # --- 2a) Claude through the Anthropic API --------------------------------------------
     if how == CLAUDE:
@@ -222,7 +309,7 @@ with tab_answer:
                                 help='Used for this request only; never saved.')
         st.caption(f'Sends {len(parts)} request(s) ({mode.lower()}). No tools are given to the model.')
         if st.button('🚀 Ask Claude', type='primary', disabled=blocked or not model):
-            send_and_save(lambda s, u: L.ask_claude(s, u, model, effort, api_key or None, allow_fallback),
+            send_and_save(lambda s, u, cb: L.ask_claude(s, u, model, effort, api_key or None, allow_fallback, cb),
                           model, dict(source='claude-api', effort=effort, allow_fallback=allow_fallback),
                           f'{model}-{effort}')
 
@@ -249,8 +336,8 @@ with tab_answer:
                    'model, and only providers that honour every setting above are used. Reasoning is always '
                    'on and there is no token limit; a reply without reasoning is rejected and retried on another host.')
         if st.button('🚀 Ask OpenRouter', type='primary', disabled=blocked or not model):
-            send_and_save(lambda s, u: LO.ask_openrouter(s, u, model, effort, api_key or None,
-                                                         float(temperature), int(seed)),
+            send_and_save(lambda s, u, cb: LO.ask_openrouter(s, u, model, effort, api_key or None,
+                                                             float(temperature), int(seed), cb),
                           model, dict(source='openrouter', effort=effort, temperature=float(temperature),
                                       seed=int(seed), max_tokens=None),
                           f'{model.split("/")[-1]}-{effort}')
@@ -265,7 +352,7 @@ with tab_answer:
         reply = up.getvalue().decode('utf-8', errors='replace') if up else pasted
         if st.button('📥 Save and score', type='primary', disabled=not reply.strip()):
             info = dict(source='manual', model=model_name or 'unknown', effort=None, mode=ONE_REQUEST,
-                        served_by=model_name or 'unknown')
+                        prompt_version=PR.PROMPT_VERSION, served_by=model_name or 'unknown')
             prompts = {'': PR.prompt_as_text(single['system'], single['user'])}
             run_dir = R.save_run(problem_dir, label or (model_name or 'manual'), info, prompts, {'': reply})
             st.session_state['selected_run'] = run_dir.name
@@ -304,10 +391,42 @@ with tab_results:
                    + (f" · effort **{i['effort']}**" if i.get('effort') else '')
                    + (f" · temperature {i['temperature']} · seed {i['seed']}" if 'temperature' in i else '')
                    + f" · source: {i.get('source')} · {i.get('mode', '')}"
+                   + (f" ({i['requests']:,} requests, {i.get('parallel', 1)} at a time)" if i.get('requests', 1) > 1 else '')
+                   + f" · prompt v{i.get('prompt_version', 1)}"
                    + (f" · {i['input_tokens']:,} in / {i['output_tokens']:,} out tokens" if i.get('input_tokens') else '')
                    + (f" ({i['reasoning_tokens']:,} reasoning)" if i.get('reasoning_tokens') else ''))
         for note in m.get('parse_notes', []):
             st.warning(f'Reading the reply: {note}')
+        if i.get('failed_parts'):
+            st.error(f"{len(i['failed_parts'])} of {i.get('requests', '?')} requests failed or were not sent; "
+                     'their variants count as unanswered.')
+
+        # Coverage first: how much of the problem the LLM answered at all (right or wrong).
+        st.subheader('Coverage')
+        if m.get('variants_total') is None:
+            st.info('This run was scored before coverage was tracked. Press **Re-score** to see it.')
+        else:
+            c = st.columns(4)
+            c[0].metric('Variants fully answered', f"{m['variants_complete']:,} / {m['variants_total']:,}",
+                        help='Every removed genotype of the variant was answered (right or wrong).')
+            c[1].metric('Partly answered', f"{m['variants_partial']:,}")
+            c[2].metric('Not answered', f"{m['variants_missing']:,}")
+            c[3].metric('Removed genotypes answered', f"{m['cells_answered']:,} / {m['cells']:,}")
+            cov = run['coverage']
+            if not cov.empty:
+                # One square per variant, in data order: the whole picture at a glance.
+                mark = {'complete': '🟩', 'partial': '🟨', 'missing': '⬜'}
+                lines = [f"`{fam}` " + ''.join(mark[s_] for s_ in grp['status'])
+                         for fam, grp in cov.groupby('family', sort=False)]
+                st.markdown('  \n'.join(lines))
+                st.caption('One square per variant, in data order: 🟩 fully answered · 🟨 partly · ⬜ not answered.')
+                with st.expander('Coverage per variant'):
+                    pick = st.multiselect('Show', ['complete', 'partial', 'missing'],
+                                          default=['complete', 'partial', 'missing'], key='cov_pick')
+                    st.dataframe(cov[cov['status'].isin(pick)], hide_index=True, use_container_width=True,
+                                 height=280)
+
+        st.subheader('Scores')
 
         # The three headline numbers.
         c = st.columns(3)
@@ -338,7 +457,12 @@ with tab_results:
                 "variant's gene). `rR`, `r/R` and `Rr` all count as the same genotype.")
 
         st.subheader('Per family')
-        st.dataframe(run['per_family'], hide_index=True, use_container_width=True)
+        pf = run['per_family'].copy()
+        if 'variants_total' in pf:
+            pf.insert(1, 'coverage', 100.0 * pf['variants_complete'] / pf['variants_total'].where(pf['variants_total'] > 0))
+        st.dataframe(pf, hide_index=True, use_container_width=True,
+                     column_config={'coverage': st.column_config.ProgressColumn(
+                         'variants fully answered', format='%.0f%%', min_value=0, max_value=100)})
 
         st.subheader('Every hypothesis')
         hyps = run['hypotheses']
@@ -354,9 +478,10 @@ with tab_results:
         st.dataframe(run['missed'], hide_index=True, use_container_width=True, height=240)
 
         with st.expander('Raw reply'):
-            for part, text in R.read_replies(run_dir).items():
-                st.markdown(f'**{part or "reply"}**')
-                st.code(text[:20000] or '(empty)', language='json')
+            replies = R.read_replies(run_dir)
+            part = st.selectbox('Request', list(replies), format_func=lambda p: p or 'reply',
+                                key='raw_part') if len(replies) > 1 else next(iter(replies), '')
+            st.code((replies.get(part) or '(empty)')[:20000], language='json')
         st.caption(f'Saved in `{run_dir}`')
 
 
@@ -370,6 +495,8 @@ with tab_compare:
         st.info('No runs yet for this problem.')
     else:
         st.dataframe(board, hide_index=True, use_container_width=True)
-        st.caption('up_to_date = scored with the current answer key. Re-score older runs in tab 3.')
+        st.caption('variants_covered = variants with every removed genotype answered / all variants to answer. '
+                   'prompt_version: runs with different versions got different instructions. '
+                   'up_to_date = scored with the current answer key. Re-score older runs in tab 3.')
         st.download_button('⬇️ Download as CSV', board.to_csv(index=False),
                            file_name=f'{problem_dir.name}_llm_runs.csv', mime='text/csv')

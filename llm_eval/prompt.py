@@ -28,7 +28,7 @@ They say nothing about any particular family or answer.
 """
 
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from data import variant_id
 
@@ -43,13 +43,15 @@ ALLOWED_KEYS = {
 }
 
 
-def family_view(fam: dict) -> dict:
-    """One family, reduced to what is needed to solve it (see the whitelist above)."""
+def family_view(fam: dict, variants_only: Optional[List[str]] = None) -> dict:
+    """One family, reduced to what is needed to solve it (see the whitelist above).
+    `variants_only` keeps only the named variants (for one request per variant)."""
     people = [dict(id=p['id'], sex=p.get('sex'), father=p.get('father'), mother=p.get('mother'))
               for p in fam['people']]
     variants = [dict(variant=variant_id(v['chrom'], v['pos']), gene=v['gene'],
                      genotypes={pid: g for pid, g in v['genotypes'].items()})
-                for v in fam.get('variants', [])]
+                for v in fam.get('variants', [])
+                if variants_only is None or variant_id(v['chrom'], v['pos']) in variants_only]
     # Who has at least one removed genotype. This is just a convenience: the same information is
     # visible from the nulls themselves.
     removed = sorted({pid for v in variants for pid, g in v['genotypes'].items() if g is None}, key=int)
@@ -57,10 +59,23 @@ def family_view(fam: dict) -> dict:
                 variants=variants)
 
 
-def llm_view(problem: dict, families: List[str] = None) -> List[dict]:
-    """The view for all families (or only the named ones, when sending one family per request)."""
-    return [family_view(f) for f in problem['families']
+def llm_view(problem: dict, families: List[str] = None, variants: List[str] = None) -> List[dict]:
+    """The view for all families (or only the named ones, when sending one family per request;
+    or only the named variants of them, when sending one variant per request)."""
+    return [family_view(f, variants) for f in problem['families']
             if families is None or f['family'] in families]
+
+
+def targets(problem: dict) -> List[Tuple[str, str, int]]:
+    """Every (family, variant, number of removed genotypes) the LLM has to answer, in data order.
+    Read from the problem file only (nulls), so it works before the problem is solved."""
+    out = []
+    for f in problem['families']:
+        for v in f.get('variants', []):
+            n = sum(g is None for g in v['genotypes'].values())
+            if n:
+                out.append((f['family'], variant_id(v['chrom'], v['pos']), n))
+    return out
 
 
 # ----------------------------------------------------------------------------------------------
@@ -97,17 +112,33 @@ THE RULES (Mendelian inheritance)
 - If no consistent way exists at all, the list for that person and variant is empty: [].
 
 WHAT TO ANSWER
-- One answer for every person and variant whose genotype is null — and only for those.
+- An answer for every person and variant whose genotype is null — and only for those.
 - For each, list every possible genotype (each at most once), written with that variant's letter.
+- Answer EVERY variant of EVERY family that has a null genotype. The answer must be complete: do not
+  stop early, skip variants, summarise, or say "and so on".
 
 OUTPUT FORMAT
-Reply with JSON only, exactly in this shape:
+Reply with JSON only. Give one entry per variant. Inside it, put people who have the same list of
+possible genotypes together in one group; every person whose genotype is null at that variant
+appears in exactly one group of that variant. For example:
 {"answers": [
-  {"family": "family_001", "variant": "1:446", "individual": "2", "genotypes": ["RR", "Rr"]},
-  {"family": "family_001", "variant": "1:446", "individual": "8", "genotypes": ["rr"]}
+  {"family": "family_001", "variant": "1:446", "groups": [
+    {"genotypes": ["RR", "Rr"], "individuals": ["2", "7", "11"]},
+    {"genotypes": ["rr"], "individuals": ["8"]}
+  ]},
+  {"family": "family_001", "variant": "1:502", "groups": [
+    {"genotypes": ["Qq"], "individuals": ["2", "8"]}
+  ]}
 ]}
+A group with "genotypes": [] holds people with no consistent genotype.
 Use the family names, variant names and individual IDs exactly as given in the data.
 """
+
+# Bumped whenever the instructions or the answer format change, and saved with every run, so runs
+# made with different instructions are never compared without noticing.
+#   1  one entry per person ({"family", "variant", "individual", "genotypes"})
+#   2  one entry per variant, people grouped by their list of genotypes; "answer every variant"
+PROMPT_VERSION = 2
 
 # The answer format as a JSON Schema. When the Claude API is used, this is passed as a
 # structured-output format so the reply is always valid JSON in exactly this shape. (Answers pasted
@@ -122,10 +153,20 @@ ANSWER_SCHEMA = {
                 'properties': {
                     'family': {'type': 'string'},
                     'variant': {'type': 'string'},
-                    'individual': {'type': 'string'},
-                    'genotypes': {'type': 'array', 'items': {'type': 'string'}},
+                    'groups': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'genotypes': {'type': 'array', 'items': {'type': 'string'}},
+                                'individuals': {'type': 'array', 'items': {'type': 'string'}},
+                            },
+                            'required': ['genotypes', 'individuals'],
+                            'additionalProperties': False,
+                        },
+                    },
                 },
-                'required': ['family', 'variant', 'individual', 'genotypes'],
+                'required': ['family', 'variant', 'groups'],
                 'additionalProperties': False,
             },
         },
@@ -142,9 +183,10 @@ def build_user_prompt(view: List[dict]) -> str:
     return f'{TASK_INSTRUCTIONS}\nDATA\n{data}\n'
 
 
-def build_prompt(problem: dict, families: List[str] = None) -> Tuple[str, str, List[dict]]:
+def build_prompt(problem: dict, families: List[str] = None,
+                 variants: List[str] = None) -> Tuple[str, str, List[dict]]:
     """Returns (system prompt, user prompt, the view used to build it)."""
-    view = llm_view(problem, families)
+    view = llm_view(problem, families, variants)
     return SYSTEM_PROMPT, build_user_prompt(view), view
 
 
@@ -187,13 +229,13 @@ def leak_check(view: List[dict], prompt_text: str, problem: dict, solution: dict
     # (b) Every scored cell is hidden (null) in the view.
     shown = {(f['family'], v['variant'], pid): g
              for f in view for v in f['variants'] for pid, g in v['genotypes'].items()}
-    in_view = {f['family'] for f in view}
+    in_view = {(f['family'], v['variant']) for f in view for v in f['variants']}
     leaked, scored = [], 0
     for fam in solution['families']:
-        if fam['family'] not in in_view:
-            continue
         for v in fam['variants']:
             vid = variant_id(v['chrom'], v['pos'])
+            if (fam['family'], vid) not in in_view:
+                continue
             for pid in v['people']:
                 scored += 1
                 if shown.get((fam['family'], vid, pid)) is not None:
